@@ -1306,15 +1306,25 @@ void create_button_payment_screen()
     lv_label_set_text(caption, "เลือกจำนวนเงิน");
     lv_obj_set_style_text_font(caption, &sarabun_20, 0);
     lv_obj_set_style_text_color(caption, COL_MUTED, 0);
-    lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 20, 52);
+    lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 20, 50);
 
-    // กริดปุ่มจำนวนเงิน — ห่อด้วย flex row-wrap กันไม่ต้องคำนวณตำแหน่งเองตามจำนวนปุ่มที่แอดมินตั้ง
+    // กริดปุ่มจำนวนเงิน — คงที่ 4 คอลัมน์เสมอ (รองรับสูงสุด 8 ปุ่ม = 2 แถวพอดี ไม่ล้นจอ 480x320
+    // ไม่ว่าแอดมินจะตั้งกี่ปุ่มก็ตาม) ความสูงกริดเป็น LV_SIZE_CONTENT ให้พอดีกับจำนวนแถวจริง
+    // แทนที่จะเป็นความสูงคงที่ที่คำนวณผิดจนเนื้อหาล้นออกนอกกรอบ/นอกจอ
+    const int GRID_COLS = 4;
+    const int GRID_GAP = 10;
+    const int GRID_W = 448; // หน้าจอ 480 กว้าง - ขอบข้างละ 16
+    const int BTN_W = (GRID_W - (GRID_COLS - 1) * GRID_GAP) / GRID_COLS;
+    const int BTN_H = 92;
+
     lv_obj_t *grid = lv_obj_create(screen);
     lv_obj_remove_style_all(grid);
-    lv_obj_set_size(grid, lv_pct(100) - 32, 220);
-    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 86);
+    lv_obj_set_size(grid, GRID_W, LV_SIZE_CONTENT);
+    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 84);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(grid, GRID_GAP, 0);
+    lv_obj_set_style_pad_row(grid, GRID_GAP, 0);
     lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
 
     int defaults[7] = {5, 10, 20, 50, 100, 500, 1000};
@@ -1324,7 +1334,7 @@ void create_button_payment_screen()
         int amt = g_cfg.preset_amount_count > 0 ? g_cfg.preset_amounts[i] : defaults[i];
 
         lv_obj_t *btn = lv_btn_create(grid);
-        lv_obj_set_size(btn, 132, 92);
+        lv_obj_set_size(btn, BTN_W, BTN_H);
         lv_obj_set_style_bg_color(btn, COL_SURFACE, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn, 14, 0);
@@ -1339,7 +1349,7 @@ void create_button_payment_screen()
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text_fmt(lbl, "%d", amt);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -10);
 
