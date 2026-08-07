@@ -76,6 +76,27 @@ static String g_device_key = "";
 
 // Idle Banner Slideshow (แสดงเต็มจอสลับรูปเมื่อไม่มีการแตะหน้าจอ)
 #define MAX_BANNERS 5
+
+// ค่าตั้งค่าทั้งหมดที่ย้ายไปให้แอดมินตั้งจากฝั่ง server แล้ว (admin.php) — บอร์ด fetch มาตอนบูท
+// ผ่าน device_config.php ครั้งเดียวหลัง pairing สำเร็จ แล้วจำไว้จนกว่าจะ reboot ใหม่ (หรือแอดมิน
+// แก้ค่าแล้วรอบูทรอบถัดไป) แคชลง NVS ไว้ด้วยกันกรณี fetch ไม่ได้ตอนบูท (เช่น เน็ตหลุดชั่วคราว)
+struct DeviceConfig
+{
+    String shop_name = "357 PAYBOX";
+    String entry_method = "keypad"; // "keypad" หรือ "button"
+    int preset_amounts[8] = {5, 10, 20, 50, 100, 500, 1000, 0};
+    int preset_amount_count = 7;
+    int op_mode = 3; // 1=Pulse, 2=ThankYou, 3=Payment
+    int pulse_pin = 14;
+    int pulse_baht_inc = 0;
+    String ty_api = "";
+    String ty_msg = "Thank You!";
+    int pay_inc = 10;
+    String pay_ty_msg = "Payment Received!";
+    String banner_urls[MAX_BANNERS];
+    int banner_idle_sec = 20;
+};
+static DeviceConfig g_cfg;
 // PNG decoder struct หนักมาก (~40KB, ตัว ucZLIB buffer ข้างในอย่างเดียวก็ 32KB) ถ้าเป็น global ตรงๆ
 // จะไปกิน internal DRAM อันมีค่าถาวรตลอดการทำงาน (พบว่าเป็นสาเหตุหลักที่ทำให้ TLS handshake ของ
 // HTTPS ล้มเหลวเป็นระยะๆ ด้วย "SSL - Memory allocation failed" เพราะ DRAM เหลือไม่พอ) จึงจอง
@@ -119,23 +140,13 @@ static int banner_decode_target_h = 0;
 const char *P_CONFIGURED = "configured";
 const char *P_WIFI_SSID = "wifi_ssid";
 const char *P_WIFI_PASS = "wifi_pass";
-const char *P_OP_MODE = "op_mode";
-// Mode 1: Pulse
-const char *P_PULSE_PIN = "pulse_pin";
-const char *P_PULSE_BAHT_INC = "pulse_baht"; // ทุกกี่บาท pulse 1 ครั้ง (0 = pulse ครั้งเดียวต่อรายการ)
-// Mode 2: Thank You
-const char *P_THANKYOU_API = "ty_api";
-const char *P_THANKYOU_MSG = "ty_msg";
-// Mode 3: Payment
-const char *P_PAY_INCREMENT = "pay_inc";
-const char *P_PAY_THANKYOU_MSG = "pay_ty_msg";
 // รหัสเครื่อง (device key) ที่ได้จากขั้นตอน pairing — ใช้ประกอบ URL ของ backend ทุก endpoint
 // (ไม่ต้องกรอก URL/key เองอีกต่อไป เพราะ BACKEND_BASE_URL ถูก hardcode ไว้แล้ว)
 const char *P_DEVICE_KEY = "device_key";
 const char *P_DEVICE_PAIRED = "dev_paired";
-// Idle Banner Slideshow (ใช้ร่วมกันทุกโหมด)
-const char *P_BANNER_URL[MAX_BANNERS] = {"banner_url_1", "banner_url_2", "banner_url_3", "banner_url_4", "banner_url_5"};
-const char *P_BANNER_IDLE_SEC = "banner_idle";
+// หมายเหตุ: โหมดรับยอด/pulse/thank you/payment/banner ทั้งหมดย้ายไปเก็บใน DeviceConfig (g_cfg)
+// ที่ fetch จาก admin.php แล้วแคชด้วย prefix "c_" แทนคีย์ preferences เดิมพวกนี้ (ดู
+// load_cached_device_config()/fetch_device_config())
 
 // App State
 enum AppState
@@ -155,6 +166,10 @@ struct NetworkRequest
 void main_app_task(void *pvParameters);
 void network_task(void *pvParameters);
 void create_main_payment_screen();
+void create_button_payment_screen();
+void create_payment_entry_screen();
+void load_cached_device_config();
+bool fetch_device_config();
 void create_banner_screen();
 void banner_fetch_task(void *pvParameters);
 void play_payment_audio_task(void *pvParameters);
@@ -206,52 +221,16 @@ void web_server_task(void *pvParameters)
     }
 }
 
+// หน้า setup ของบอร์ดเหลือแค่กรอก WiFi เท่านั้น — ค่าอื่นๆ ทั้งหมด (โหมดรับยอด/ปุ่มพรีเซ็ต/pulse/
+// thank you/ชื่อร้าน/banner) ย้ายไปให้แอดมินตั้งจาก admin.php แล้วให้บอร์ด fetch เอง (ดู
+// fetch_device_config()) เพราะแอดมินเป็นคนรู้ว่าลูกค้าต้องการตั้งค่าอย่างไร ไม่ต้องเดินไปกรอกที่
+// หน้าจอบอร์ดทีละเครื่อง
 void handle_web_save()
 {
     Serial.println("Saving configuration...");
     preferences.begin("paybox-cfg", false);
-
-    // Save WiFi
     preferences.putString(P_WIFI_SSID, server.arg("wifi_ssid"));
     preferences.putString(P_WIFI_PASS, server.arg("wifi_pass"));
-
-    // Save Mode
-    String modeStr = server.arg("op_mode");
-    int mode = 0;
-    if (modeStr == "pulse")
-        mode = 1;
-    if (modeStr == "thankyou")
-        mode = 2;
-    if (modeStr == "payment")
-        mode = 3;
-    preferences.putInt(P_OP_MODE, mode);
-
-    // Save mode-specific settings
-    switch (mode)
-    {
-    case 1:
-        preferences.putInt(P_PULSE_PIN, server.arg("pulse_pin").toInt());
-        preferences.putInt(P_PULSE_BAHT_INC, server.arg("pulse_baht_inc").toInt());
-        break;
-    case 2:
-        preferences.putString(P_THANKYOU_API, server.arg("ty_api"));
-        preferences.putString(P_THANKYOU_MSG, server.arg("ty_msg"));
-        break;
-    case 3:
-        preferences.putInt(P_PAY_INCREMENT, server.arg("pay_inc").toInt());
-        preferences.putString(P_PAY_THANKYOU_MSG, server.arg("pay_ty_msg"));
-        break;
-    }
-
-    // Save Idle Banner Slideshow (ใช้ร่วมกันทุกโหมด, ไม่บังคับ, สูงสุด 5 รูป)
-    for (int i = 0; i < MAX_BANNERS; i++)
-    {
-        String fieldName = "banner_url_" + String(i + 1);
-        preferences.putString(P_BANNER_URL[i], server.arg(fieldName));
-    }
-    int bannerIdleSec = server.arg("banner_idle_sec").toInt();
-    preferences.putInt(P_BANNER_IDLE_SEC, bannerIdleSec > 0 ? bannerIdleSec : 20);
-
     preferences.putBool(P_CONFIGURED, true);
     preferences.end();
 
@@ -599,6 +578,150 @@ String run_device_pairing_flow()
 }
 
 // =================================================================
+//   DEVICE CONFIG (ตั้งค่าทั้งหมดจากฝั่ง admin.php แทนหน้า setup ของบอร์ดเอง)
+// =================================================================
+// อ่านค่าที่แคชไว้ใน NVS ครั้งก่อน (กรณี fetch_device_config() ตอนบูทนี้ทำไม่ได้ เช่น เน็ตหลุด
+// ชั่วคราว) เรียกก่อน fetch เสมอ เพื่อให้มีค่า fallback ที่สมเหตุสมผลระหว่างรอ fetch จบ
+void load_cached_device_config()
+{
+    preferences.begin("paybox-cfg", true);
+    g_cfg.shop_name = preferences.getString("c_shop", "357 PAYBOX");
+    g_cfg.entry_method = preferences.getString("c_entry", "keypad");
+    g_cfg.op_mode = preferences.getInt("c_opmode", 3);
+    g_cfg.pulse_pin = preferences.getInt("c_ppin", 14);
+    g_cfg.pulse_baht_inc = preferences.getInt("c_pinc", 0);
+    g_cfg.ty_api = preferences.getString("c_tyapi", "");
+    g_cfg.ty_msg = preferences.getString("c_tymsg", "Thank You!");
+    g_cfg.pay_inc = preferences.getInt("c_payinc", 10);
+    g_cfg.pay_ty_msg = preferences.getString("c_ptymsg", "Payment Received!");
+    String presetsStr = preferences.getString("c_preset", "5,10,20,50,100,500,1000");
+    for (int i = 0; i < MAX_BANNERS; i++)
+    {
+        g_cfg.banner_urls[i] = preferences.getString(("c_ban" + String(i)).c_str(), "");
+    }
+    g_cfg.banner_idle_sec = preferences.getInt("c_banidle", 20);
+    preferences.end();
+
+    g_cfg.preset_amount_count = 0;
+    int start = 0;
+    for (int i = 0; i <= (int)presetsStr.length(); i++)
+    {
+        if (i == (int)presetsStr.length() || presetsStr[i] == ',')
+        {
+            if (i > start && g_cfg.preset_amount_count < 8)
+            {
+                g_cfg.preset_amounts[g_cfg.preset_amount_count++] = presetsStr.substring(start, i).toInt();
+            }
+            start = i + 1;
+        }
+    }
+    if (g_cfg.preset_amount_count == 0)
+    {
+        int defaults[7] = {5, 10, 20, 50, 100, 500, 1000};
+        memcpy(g_cfg.preset_amounts, defaults, sizeof(defaults));
+        g_cfg.preset_amount_count = 7;
+    }
+}
+
+// ดึงค่าตั้งค่าล่าสุดจาก device_config.php (ต้องมี g_device_key + WiFi ต่อแล้ว) แล้วเขียนทับทั้ง
+// g_cfg (in-memory ใช้งานจริง) และแคชลง NVS ไว้เผื่อบูทครั้งถัดไปไม่มีเน็ตตอนแรก
+bool fetch_device_config()
+{
+    if (WiFi.status() != WL_CONNECTED || g_device_key.length() == 0)
+    {
+        return false;
+    }
+
+    HTTPClient http_cfg;
+    String url = String(BACKEND_BASE_URL) + "device_config.php?key=" + g_device_key;
+    bool ok = false;
+    if (http_cfg.begin(url))
+    {
+        int httpCode = http_cfg.GET();
+        if (httpCode == HTTP_CODE_OK)
+        {
+            String payload = http_cfg.getString();
+            DynamicJsonDocument doc(2048);
+            if (deserializeJson(doc, payload) == DeserializationError::Ok && doc["success"] == true)
+            {
+                g_cfg.shop_name = String((const char *)(doc["shop_name"] | "357 PAYBOX"));
+                g_cfg.entry_method = String((const char *)(doc["entry_method"] | "keypad"));
+                g_cfg.op_mode = doc["op_mode"] | 3;
+                g_cfg.pulse_pin = doc["pulse_pin"] | 14;
+                g_cfg.pulse_baht_inc = doc["pulse_baht_inc"] | 0;
+                g_cfg.ty_api = String((const char *)(doc["ty_api"] | ""));
+                g_cfg.ty_msg = String((const char *)(doc["ty_msg"] | "Thank You!"));
+                g_cfg.pay_inc = doc["pay_inc"] | 10;
+                g_cfg.pay_ty_msg = String((const char *)(doc["pay_ty_msg"] | "Payment Received!"));
+                g_cfg.banner_idle_sec = doc["banner_idle_sec"] | 20;
+
+                g_cfg.preset_amount_count = 0;
+                JsonArray presetArr = doc["preset_amounts"].as<JsonArray>();
+                for (JsonVariant v : presetArr)
+                {
+                    if (g_cfg.preset_amount_count < 8)
+                    {
+                        g_cfg.preset_amounts[g_cfg.preset_amount_count++] = v.as<int>();
+                    }
+                }
+                if (g_cfg.preset_amount_count == 0)
+                {
+                    int defaults[7] = {5, 10, 20, 50, 100, 500, 1000};
+                    memcpy(g_cfg.preset_amounts, defaults, sizeof(defaults));
+                    g_cfg.preset_amount_count = 7;
+                }
+
+                JsonArray bannerArr = doc["banner_urls"].as<JsonArray>();
+                int bi = 0;
+                for (JsonVariant v : bannerArr)
+                {
+                    if (bi < MAX_BANNERS)
+                    {
+                        g_cfg.banner_urls[bi++] = String((const char *)(v | ""));
+                    }
+                }
+
+                ok = true;
+
+                preferences.begin("paybox-cfg", false);
+                preferences.putString("c_shop", g_cfg.shop_name);
+                preferences.putString("c_entry", g_cfg.entry_method);
+                preferences.putInt("c_opmode", g_cfg.op_mode);
+                preferences.putInt("c_ppin", g_cfg.pulse_pin);
+                preferences.putInt("c_pinc", g_cfg.pulse_baht_inc);
+                preferences.putString("c_tyapi", g_cfg.ty_api);
+                preferences.putString("c_tymsg", g_cfg.ty_msg);
+                preferences.putInt("c_payinc", g_cfg.pay_inc);
+                preferences.putString("c_ptymsg", g_cfg.pay_ty_msg);
+                preferences.putInt("c_banidle", g_cfg.banner_idle_sec);
+                String presetsStr = "";
+                for (int i = 0; i < g_cfg.preset_amount_count; i++)
+                {
+                    if (i)
+                        presetsStr += ",";
+                    presetsStr += String(g_cfg.preset_amounts[i]);
+                }
+                preferences.putString("c_preset", presetsStr);
+                for (int i = 0; i < MAX_BANNERS; i++)
+                {
+                    preferences.putString(("c_ban" + String(i)).c_str(), g_cfg.banner_urls[i]);
+                }
+                preferences.end();
+
+                Serial.printf("DeviceConfig: fetched OK (shop='%s', entry=%s, op_mode=%d)\n",
+                              g_cfg.shop_name.c_str(), g_cfg.entry_method.c_str(), g_cfg.op_mode);
+            }
+        }
+        else
+        {
+            Serial.printf("DeviceConfig: fetch failed, HTTP code=%d\n", httpCode);
+        }
+        http_cfg.end();
+    }
+    return ok;
+}
+
+// =================================================================
 //   DARK PREMIUM THEME
 // =================================================================
 // จานสีกลางของทั้งแอป - แก้ที่เดียวเปลี่ยนได้ทุกหน้าจอ
@@ -614,11 +737,18 @@ String run_device_pairing_flow()
 
 void style_init(void)
 {
-    // พื้นหลังของแป้นตัวเลข - โปร่งใส ให้กลืนกับพื้นหลังหน้าจอ
+    // พื้นหลังของแป้นตัวเลข - ทำเป็นการ์ดคู่กับฝั่งยอดเงิน ให้ทั้งจอดูเป็นชุดเดียวกัน ไม่ใช่ปุ่มลอยเดี่ยวๆ
     lv_style_init(&style_numpad_bg);
-    lv_style_set_bg_opa(&style_numpad_bg, LV_OPA_TRANSP);
-    lv_style_set_border_width(&style_numpad_bg, 0);
-    lv_style_set_pad_all(&style_numpad_bg, 0);
+    lv_style_set_bg_color(&style_numpad_bg, COL_SURFACE);
+    lv_style_set_bg_opa(&style_numpad_bg, LV_OPA_COVER);
+    lv_style_set_radius(&style_numpad_bg, 18);
+    lv_style_set_border_width(&style_numpad_bg, 1);
+    lv_style_set_border_color(&style_numpad_bg, COL_BORDER);
+    lv_style_set_shadow_width(&style_numpad_bg, 20);
+    lv_style_set_shadow_color(&style_numpad_bg, lv_color_black());
+    lv_style_set_shadow_opa(&style_numpad_bg, LV_OPA_40);
+    lv_style_set_shadow_ofs_y(&style_numpad_bg, 6);
+    lv_style_set_pad_all(&style_numpad_bg, 14);
     lv_style_set_pad_gap(&style_numpad_bg, 8);
 
     // ปุ่มตัวเลขแต่ละปุ่ม
@@ -832,7 +962,7 @@ static void banner_dismiss_event_cb(lv_event_t *e)
     }
     banner_img_obj = NULL;
     lv_disp_trig_activity(NULL);
-    create_main_payment_screen();
+    create_payment_entry_screen();
 }
 
 void create_banner_screen()
@@ -919,12 +1049,24 @@ void create_main_payment_screen()
     lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
+    // แถบเน้นสีบางๆ บนสุดของจอ - จุดสังเกตแบรนด์แบบเครื่อง POS ระดับพรีเมียม
+    lv_obj_t *top_accent = lv_obj_create(screen);
+    lv_obj_remove_style_all(top_accent);
+    lv_obj_set_size(top_accent, lv_pct(100), 3);
+    lv_obj_align(top_accent, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(top_accent, COL_ACCENT, 0);
+    lv_obj_set_style_bg_opa(top_accent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(top_accent, LV_OBJ_FLAG_SCROLLABLE);
+
     // ---------- แถบหัวจอ ----------
     lv_obj_t *header = lv_obj_create(screen);
     lv_obj_remove_style_all(header);
-    lv_obj_set_size(header, lv_pct(100), 34);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_size(header, lv_pct(100), 38);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 3);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(header, 1, 0);
+    lv_obj_set_style_border_color(header, COL_BORDER, 0);
 
     lv_obj_t *brand_dot = lv_obj_create(header);
     lv_obj_remove_style_all(brand_dot);
@@ -933,12 +1075,15 @@ void create_main_payment_screen()
     lv_obj_set_style_radius(brand_dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(brand_dot, COL_ACCENT, 0);
     lv_obj_set_style_bg_opa(brand_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(brand_dot, 8, 0);
+    lv_obj_set_style_shadow_color(brand_dot, COL_ACCENT, 0);
+    lv_obj_set_style_shadow_opa(brand_dot, LV_OPA_60, 0);
 
     lv_obj_t *brand = lv_label_create(header);
-    lv_label_set_text(brand, "357 PAYBOX");
+    lv_label_set_text(brand, g_cfg.shop_name.c_str());
     lv_obj_set_style_text_font(brand, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(brand, COL_MUTED, 0);
-    lv_obj_set_style_text_letter_space(brand, 2, 0);
+    lv_obj_set_style_text_letter_space(brand, 3, 0);
     lv_obj_align(brand, LV_ALIGN_LEFT_MID, 32, 0);
 
     lv_obj_t *wifi_icon = lv_label_create(header);
@@ -948,47 +1093,66 @@ void create_main_payment_screen()
                                 WiFi.status() == WL_CONNECTED ? COL_ACCENT : COL_MUTED, 0);
     lv_obj_align(wifi_icon, LV_ALIGN_RIGHT_MID, -16, 0);
 
-    // ---------- ฝั่งซ้าย: ยอดเงิน + ปุ่มสั่งงาน ----------
+    // ---------- ฝั่งซ้าย: ยอดเงิน + ปุ่มสั่งงาน (การ์ดยกขึ้นมาจากพื้นหลัง ให้ความรู้สึกพรีเมียมกว่าแบบแบนราบ) ----------
     lv_obj_t *left = lv_obj_create(screen);
     lv_obj_remove_style_all(left);
     lv_obj_set_size(left, 236, 268);
-    lv_obj_align(left, LV_ALIGN_TOP_LEFT, 16, 40);
+    lv_obj_align(left, LV_ALIGN_TOP_LEFT, 16, 44);
     lv_obj_clear_flag(left, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(left, COL_SURFACE, 0);
+    lv_obj_set_style_bg_opa(left, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(left, 0, 0);
+    lv_obj_set_style_border_width(left, 1, 0);
+    lv_obj_set_style_border_color(left, COL_BORDER, 0);
+    lv_obj_set_style_shadow_width(left, 20, 0);
+    lv_obj_set_style_shadow_color(left, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(left, LV_OPA_40, 0);
+    lv_obj_set_style_shadow_ofs_y(left, 6, 0);
 
     lv_obj_t *caption = lv_label_create(left);
     lv_label_set_text(caption, "ยอดชำระ");
     lv_obj_set_style_text_font(caption, &sarabun_20, 0);
     lv_obj_set_style_text_color(caption, COL_MUTED, 0);
-    lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 4, 0);
+    lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 20, 16);
 
-    // ยอดเงิน - ตัวเลขใหญ่สุดบนหน้าจอ อ่านได้จากระยะไกล
-    lv_obj_t *currency = lv_label_create(left);
-    lv_label_set_text(currency, "THB");
-    lv_obj_set_style_text_font(currency, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(currency, COL_MUTED, 0);
-    lv_obj_align(currency, LV_ALIGN_TOP_LEFT, 4, 34);
+    // ป้ายสกุลเงินแบบ badge - รายละเอียดเล็กๆ ที่ทำให้ดูออกแบบมาอย่างตั้งใจ ไม่ใช่แค่ตัวหนังสือลอยๆ
+    lv_obj_t *currency = lv_obj_create(left);
+    lv_obj_remove_style_all(currency);
+    lv_obj_set_size(currency, LV_SIZE_CONTENT, 20);
+    lv_obj_align(currency, LV_ALIGN_TOP_LEFT, 20, 42);
+    lv_obj_set_style_radius(currency, 10, 0);
+    lv_obj_set_style_bg_color(currency, COL_SURFACE_HI, 0);
+    lv_obj_set_style_bg_opa(currency, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(currency, 8, 0);
+    lv_obj_clear_flag(currency, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *currency_label = lv_label_create(currency);
+    lv_label_set_text(currency_label, "THB");
+    lv_obj_set_style_text_font(currency_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(currency_label, COL_ACCENT, 0);
+    lv_obj_set_style_text_letter_space(currency_label, 1, 0);
+    lv_obj_center(currency_label);
 
     payment_amount_label = lv_label_create(left);
     lv_label_set_text(payment_amount_label, "0");
     lv_obj_set_style_text_font(payment_amount_label, &lv_font_montserrat_48, 0);
     lv_obj_set_style_text_color(payment_amount_label, COL_TEXT, 0);
     lv_label_set_long_mode(payment_amount_label, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(payment_amount_label, 228);
-    lv_obj_align(payment_amount_label, LV_ALIGN_TOP_LEFT, 4, 54);
+    lv_obj_set_width(payment_amount_label, 196);
+    lv_obj_align(payment_amount_label, LV_ALIGN_TOP_LEFT, 20, 68);
 
     // เส้นใต้ยอดเงิน - บอกว่าช่องนี้กำลังรับค่าอยู่
     lv_obj_t *rule = lv_obj_create(left);
     lv_obj_remove_style_all(rule);
-    lv_obj_set_size(rule, 150, 3);
-    lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 4, 118);
+    lv_obj_set_size(rule, 156, 3);
+    lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 20, 134);
     lv_obj_set_style_radius(rule, 2, 0);
     lv_obj_set_style_bg_color(rule, COL_ACCENT, 0);
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
 
     // ปุ่มยกเลิก - ล้างยอดกลับเป็น 0 (แบบ outline ให้เบากว่าปุ่มยืนยัน)
     lv_obj_t *btn_clear = lv_btn_create(left);
-    lv_obj_set_size(btn_clear, 228, 46);
-    lv_obj_align(btn_clear, LV_ALIGN_BOTTOM_LEFT, 4, -60);
+    lv_obj_set_size(btn_clear, 196, 46);
+    lv_obj_align(btn_clear, LV_ALIGN_BOTTOM_LEFT, 20, -74);
     lv_obj_add_event_cb(btn_clear, clear_amount_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_set_style_bg_opa(btn_clear, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_clear, 1, 0);
@@ -1005,8 +1169,8 @@ void create_main_payment_screen()
 
     // ปุ่มยืนยัน - เป็น primary action สีเด่นที่สุดในหน้าจอ
     lv_obj_t *btn_confirm = lv_btn_create(left);
-    lv_obj_set_size(btn_confirm, 228, 50);
-    lv_obj_align(btn_confirm, LV_ALIGN_BOTTOM_LEFT, 4, 0);
+    lv_obj_set_size(btn_confirm, 196, 50);
+    lv_obj_align(btn_confirm, LV_ALIGN_BOTTOM_LEFT, 20, -16);
     lv_obj_add_event_cb(btn_confirm, numpad_bottom_btn_event_cb, LV_EVENT_CLICKED, (void *)"confirm");
     lv_obj_set_style_bg_color(btn_confirm, COL_ACCENT, 0);
     lv_obj_set_style_bg_color(btn_confirm, COL_ACCENT_DIM, LV_STATE_PRESSED);
@@ -1030,7 +1194,7 @@ void create_main_payment_screen()
 
     lv_obj_t *keypad = lv_btnmatrix_create(screen);
     lv_obj_set_size(keypad, 196, 268);
-    lv_obj_align(keypad, LV_ALIGN_TOP_RIGHT, -16, 40);
+    lv_obj_align(keypad, LV_ALIGN_TOP_RIGHT, -16, 44);
     lv_btnmatrix_set_map(keypad, keypad_map);
     lv_obj_add_event_cb(keypad, keypad_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_style(keypad, &style_numpad_bg, 0);
@@ -1041,6 +1205,152 @@ void create_main_payment_screen()
     lv_scr_load(screen);
     // ลบ screen เก่าแบบ async กันปัญหา use-after-free กรณีฟังก์ชันนี้ถูกเรียกจาก event callback
     // ของ object ที่อยู่บน screen เก่านั้นเอง (เช่นปุ่ม cancel/clear) ซึ่งยังทำงานไม่เสร็จ
+    if (old_screen != NULL)
+    {
+        lv_obj_del_async(old_screen);
+    }
+}
+
+// เลือกหน้าจอรับยอดชำระให้ตรงกับ entry_method ที่แอดมินตั้งไว้ (fetch มาจาก device_config.php)
+// ใช้แทนการเรียก create_main_payment_screen()/create_button_payment_screen() ตรงๆ ทุกจุดที่ต้อง
+// วนกลับมาหน้ารับยอดชำระ (หลังผลลัพธ์การจ่าย, ยกเลิก, ปิด banner ฯลฯ)
+void create_payment_entry_screen()
+{
+    if (g_cfg.entry_method == "button")
+    {
+        create_button_payment_screen();
+    }
+    else
+    {
+        create_main_payment_screen();
+    }
+}
+
+// กดปุ่มจำนวนเงินที่ตั้งไว้แล้วสร้าง QR ทันที (เหมาะกับธุรกิจที่มี coin acceptor ต้องการความเร็ว
+// ไม่ต้องพิมพ์จำนวนเงินเอง)
+static void preset_amount_btn_event_cb(lv_event_t *e)
+{
+    int amount = (int)(intptr_t)lv_event_get_user_data(e);
+    payment_amount = amount;
+    if (payment_amount > 0)
+    {
+        show_loading_spinner();
+        NetworkRequest req;
+        req.amount = payment_amount;
+        xQueueSend(network_queue, &req, portMAX_DELAY);
+    }
+}
+
+// หน้าจอโหมด Button — แทนแป้นตัวเลขด้วยกริดปุ่มจำนวนเงินที่แอดมินตั้งไว้ (preset_amounts)
+void create_button_payment_screen()
+{
+    banner_active = false;
+    payment_in_progress = false;
+    input_amount_str = "0";
+    payment_amount = 0;
+    numpad_overlay = NULL;
+    numpad = NULL;
+    countdown_label_global = NULL;
+
+    lv_obj_t *old_screen = lv_scr_act();
+    lv_obj_t *screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(screen, COL_BG, 0);
+    lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0x0C1014), 0);
+    lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_pad_all(screen, 0, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *top_accent = lv_obj_create(screen);
+    lv_obj_remove_style_all(top_accent);
+    lv_obj_set_size(top_accent, lv_pct(100), 3);
+    lv_obj_align(top_accent, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(top_accent, COL_ACCENT, 0);
+    lv_obj_set_style_bg_opa(top_accent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(top_accent, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(screen);
+    lv_obj_remove_style_all(header);
+    lv_obj_set_size(header, lv_pct(100), 38);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 3);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(header, 1, 0);
+    lv_obj_set_style_border_color(header, COL_BORDER, 0);
+
+    lv_obj_t *brand_dot = lv_obj_create(header);
+    lv_obj_remove_style_all(brand_dot);
+    lv_obj_set_size(brand_dot, 8, 8);
+    lv_obj_align(brand_dot, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_set_style_radius(brand_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(brand_dot, COL_ACCENT, 0);
+    lv_obj_set_style_bg_opa(brand_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(brand_dot, 8, 0);
+    lv_obj_set_style_shadow_color(brand_dot, COL_ACCENT, 0);
+    lv_obj_set_style_shadow_opa(brand_dot, LV_OPA_60, 0);
+
+    lv_obj_t *brand = lv_label_create(header);
+    lv_label_set_text(brand, g_cfg.shop_name.c_str());
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(brand, COL_MUTED, 0);
+    lv_obj_set_style_text_letter_space(brand, 3, 0);
+    lv_obj_align(brand, LV_ALIGN_LEFT_MID, 32, 0);
+
+    lv_obj_t *wifi_icon = lv_label_create(header);
+    lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(wifi_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wifi_icon,
+                                WiFi.status() == WL_CONNECTED ? COL_ACCENT : COL_MUTED, 0);
+    lv_obj_align(wifi_icon, LV_ALIGN_RIGHT_MID, -16, 0);
+
+    lv_obj_t *caption = lv_label_create(screen);
+    lv_label_set_text(caption, "เลือกจำนวนเงิน");
+    lv_obj_set_style_text_font(caption, &sarabun_20, 0);
+    lv_obj_set_style_text_color(caption, COL_MUTED, 0);
+    lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 20, 52);
+
+    // กริดปุ่มจำนวนเงิน — ห่อด้วย flex row-wrap กันไม่ต้องคำนวณตำแหน่งเองตามจำนวนปุ่มที่แอดมินตั้ง
+    lv_obj_t *grid = lv_obj_create(screen);
+    lv_obj_remove_style_all(grid);
+    lv_obj_set_size(grid, lv_pct(100) - 32, 220);
+    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 86);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+
+    int defaults[7] = {5, 10, 20, 50, 100, 500, 1000};
+    int count = g_cfg.preset_amount_count > 0 ? g_cfg.preset_amount_count : 7;
+    for (int i = 0; i < count; i++)
+    {
+        int amt = g_cfg.preset_amount_count > 0 ? g_cfg.preset_amounts[i] : defaults[i];
+
+        lv_obj_t *btn = lv_btn_create(grid);
+        lv_obj_set_size(btn, 132, 92);
+        lv_obj_set_style_bg_color(btn, COL_SURFACE, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(btn, 14, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_border_color(btn, COL_BORDER, 0);
+        lv_obj_set_style_shadow_width(btn, 12, 0);
+        lv_obj_set_style_shadow_color(btn, lv_color_black(), 0);
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_30, 0);
+        lv_obj_set_style_bg_color(btn, COL_ACCENT, LV_STATE_PRESSED);
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(btn, preset_amount_btn_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)amt);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text_fmt(lbl, "%d", amt);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -10);
+
+        lv_obj_t *unit = lv_label_create(btn);
+        lv_label_set_text(unit, "บาท");
+        lv_obj_set_style_text_font(unit, &sarabun_20, 0);
+        lv_obj_set_style_text_color(unit, COL_MUTED, 0);
+        lv_obj_align_to(unit, lbl, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    }
+
+    lv_scr_load(screen);
     if (old_screen != NULL)
     {
         lv_obj_del_async(old_screen);
@@ -1198,7 +1508,7 @@ void show_result_screen(bool success, const char *custom_success_msg)
     lv_timer_create([](lv_timer_t *t)
                     {
         lv_obj_del((lv_obj_t*)t->user_data);
-        create_main_payment_screen();
+        create_payment_entry_screen();
         lv_timer_del(t); }, 5000, result_overlay);
 }
 
@@ -1234,7 +1544,7 @@ static void cancel_payment_event_cb(lv_event_t *e)
             free(time_data);
         }
     }
-    create_main_payment_screen();
+    create_payment_entry_screen();
 }
 
 // =================================================================
@@ -1670,18 +1980,12 @@ void check_payment_status_task(void *pvParameters)
         // แจ้งด้วยเสียงว่าได้รับเงินจำนวนเท่าไหร่ — รันแยก task กันบล็อกงานอื่น (Pulse/ThankYou/แสดงผล)
         xTaskCreate(play_payment_audio_task, "PaymentAudio", 8192, (void *)(intptr_t)payment_amount, 1, NULL);
 
-        preferences.begin("paybox-cfg", true);
-        int op_mode = preferences.getInt(P_OP_MODE, 3);
-        preferences.end();
-
-        switch (op_mode)
+        switch (g_cfg.op_mode)
         {
-        case 1: // Pulse Mode: ดีเลย์สั้นๆ แล้วส่งสัญญาณ pulse ออก GPIO ที่ตั้งค่าไว้
+        case 1: // Pulse Mode: ดีเลย์สั้นๆ แล้วส่งสัญญาณ pulse ออก GPIO ที่ตั้งค่าไว้ (ตั้งจากฝั่ง admin)
         {
-            preferences.begin("paybox-cfg", true);
-            int pulse_pin = preferences.getInt(P_PULSE_PIN, 14);
-            int pulse_baht_inc = preferences.getInt(P_PULSE_BAHT_INC, 0);
-            preferences.end();
+            int pulse_pin = g_cfg.pulse_pin;
+            int pulse_baht_inc = g_cfg.pulse_baht_inc;
 
             // pulse_baht_inc = 0 หมายถึง pulse ครั้งเดียวต่อรายการ (ไม่สนใจจำนวนเงิน)
             // ถ้าตั้งไว้ เช่น 5 บาท/พัลส์ → จ่าย 25 บาท จะ pulse 5 ครั้ง (สำหรับจำลอง coin selector)
@@ -1708,10 +2012,8 @@ void check_payment_status_task(void *pvParameters)
         }
         case 2: // Thank You Mode: เรียก API ที่ตั้งไว้ (แทน {MAC}) แล้วแสดงข้อความที่ตั้งไว้
         {
-            preferences.begin("paybox-cfg", true);
-            String ty_api = preferences.getString(P_THANKYOU_API, "");
-            String ty_msg = preferences.getString(P_THANKYOU_MSG, "Thank You!");
-            preferences.end();
+            String ty_api = g_cfg.ty_api;
+            String ty_msg = g_cfg.ty_msg;
             result_message = ty_msg;
 
             if (ty_api.length() > 0 && WiFi.status() == WL_CONNECTED)
@@ -1728,9 +2030,7 @@ void check_payment_status_task(void *pvParameters)
         }
         default: // Payment Mode: ใช้ข้อความ Thank You ที่ตั้งค่าไว้สำหรับหน้าชำระเงิน
         {
-            preferences.begin("paybox-cfg", true);
-            result_message = preferences.getString(P_PAY_THANKYOU_MSG, "");
-            preferences.end();
+            result_message = g_cfg.pay_ty_msg;
             break;
         }
         }
@@ -1764,20 +2064,13 @@ void check_payment_status_task(void *pvParameters)
 // =================================================================
 static void plus_btn_event_cb(lv_event_t *e)
 {
-    preferences.begin("paybox-cfg", true);
-    int increment = preferences.getInt(P_PAY_INCREMENT, 10);
-    preferences.end();
-
-    payment_amount += increment;
+    payment_amount += g_cfg.pay_inc;
     lv_label_set_text_fmt(payment_amount_label, "%d", payment_amount);
 }
 
 static void minus_btn_event_cb(lv_event_t *e)
 {
-    preferences.begin("paybox-cfg", true);
-    int increment = preferences.getInt(P_PAY_INCREMENT, 10);
-    preferences.end();
-    payment_amount -= increment;
+    payment_amount -= g_cfg.pay_inc;
     if (payment_amount < 0)
     {
         payment_amount = 0;
@@ -1880,7 +2173,7 @@ void network_task(void *pvParameters)
                 }
                 else
                 {
-                    create_main_payment_screen();
+                    create_payment_entry_screen();
                 }
                 lvgl_port_unlock();
             }
@@ -1921,8 +2214,10 @@ void main_app_task(void *pvParameters)
         preferences.begin("paybox-cfg", true);
         String ssid = preferences.getString(P_WIFI_SSID, "");
         String pass = preferences.getString(P_WIFI_PASS, "");
-        int op_mode = preferences.getInt(P_OP_MODE, 0);
         preferences.end();
+        // ใช้ค่าที่แคชไว้จากการ fetch ครั้งก่อนเป็นค่าเริ่มต้น เผื่อ fetch_device_config() รอบนี้
+        // ทำไม่ได้ตอนบูท (เช่น backend ล่มชั่วคราว) จะได้ยังมีค่าที่สมเหตุสมผลใช้งานต่อ
+        load_cached_device_config();
         create_ui_connecting_wifi_screen(ssid.c_str());
         WiFi.mode(WIFI_STA);
         // ปิด WiFi power-save ฝั่ง ESP32 — ถ้าเปิดไว้ (ค่า default) จะชนกับ power-saving ของ
@@ -1972,6 +2267,14 @@ void main_app_task(void *pvParameters)
             g_device_key = storedDeviceKey;
             Serial.printf("Device key: %s\n", g_device_key.c_str());
 
+            // ดึงค่าตั้งค่าทั้งหมด (ชื่อร้าน/โหมดรับยอด/pulse/thank you/banner ฯลฯ) จาก admin.php
+            // ครั้งเดียวตอนบูทนี้ — ถ้าทำไม่ได้ (เน็ตหลุดตอน fetch พอดี) จะใช้ค่าที่แคชไว้จาก
+            // load_cached_device_config() ด้านบนแทนไปก่อน แล้วลองใหม่ตอน reboot ครั้งถัดไป
+            if (!fetch_device_config())
+            {
+                Serial.println("DeviceConfig: fetch failed, using last cached settings");
+            }
+
             // ซิงก์ clip เสียงคำศัพท์ลง SD การ์ด (ถ้ายังไม่มี) — หลังจากนี้เล่นเสียงจะอ่านจาก SD ล้วนๆ
             xTaskCreate(sync_audio_clips_task, "AudioSync", 8192, NULL, 1, NULL);
 
@@ -1980,38 +2283,25 @@ void main_app_task(void *pvParameters)
             String otaUrl = String(BACKEND_BASE_URL) + "firmware_check.php?key=" + g_device_key + "&version=";
             xTaskCreate(ota_check_task, "OtaCheck", 8192, strdup(otaUrl.c_str()), 1, NULL);
 
-            preferences.begin("paybox-cfg", true);
-            // เว้นค่า default ไว้เฉพาะ slot แรกเพื่อทดสอบ ส่วน slot 2-5 เป็น placeholder ตัวอย่าง
-            // (เข้าหน้า setup แล้วเปลี่ยนเป็น URL จริงของแต่ละร้านได้ทีหลัง)
-            static const char *default_banner_urls[MAX_BANNERS] = {
-                "https://ttmb-tech.com/paybox-api/banner1.png",
-                "https://placehold.co/480x320/1a73e8/white.png?text=Banner+2",
-                "https://placehold.co/480x320/e91e63/white.png?text=Banner+3",
-                "https://placehold.co/480x320/34a853/white.png?text=Banner+4",
-                "https://placehold.co/480x320/fbbc05/333333.png?text=Banner+5",
-            };
             String *bannerUrls = new String[MAX_BANNERS];
             for (int i = 0; i < MAX_BANNERS; i++)
             {
-                bannerUrls[i] = preferences.getString(P_BANNER_URL[i], default_banner_urls[i]);
+                bannerUrls[i] = g_cfg.banner_urls[i];
             }
-            int bannerIdleSec = preferences.getInt(P_BANNER_IDLE_SEC, 20);
-            preferences.end();
-            banner_idle_ms = (uint32_t)(bannerIdleSec > 0 ? bannerIdleSec : 20) * 1000;
+            banner_idle_ms = (uint32_t)(g_cfg.banner_idle_sec > 0 ? g_cfg.banner_idle_sec : 20) * 1000;
             xTaskCreate(banner_fetch_task, "BannerFetch", 12288, bannerUrls, 1, NULL);
 
             if (lvgl_port_lock(0))
             {
-                switch (op_mode)
+                switch (g_cfg.op_mode)
                 {
                 case 1: // Pulse Mode: ทำ flow ชำระเงินเหมือนกัน แต่หลังสำเร็จจะส่ง pulse ออก GPIO แทน
                 case 2: // Thank You Mode: ทำ flow ชำระเงินเหมือนกัน แต่หลังสำเร็จจะเรียก API + โชว์ข้อความ Thank You แทน
                 case 3: // Payment Mode: flow ชำระเงินปกติ
-                    create_main_payment_screen();
+                default: // ค่า op_mode ที่ไม่รู้จัก (เช่น fetch พัง) — fallback เป็น flow ชำระเงินปกติ กันจอค้าง
+                    create_payment_entry_screen();
                     xTaskCreate(network_task, "NetworkTask", 10240, NULL, 2, NULL);
                     lv_timer_create(idle_check_timer_cb, 1000, NULL);
-                    break;
-                default:
                     break;
                 }
                 lvgl_port_unlock();
