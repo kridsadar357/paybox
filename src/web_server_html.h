@@ -80,8 +80,11 @@ window.onload = function() { scanWifi(); };
       <select name="pulse_pin">
         <option value="14">GPIO 14</option><option value="9">GPIO 9</option><option value="46">GPIO 46</option><option value="16">GPIO 16</option><option value="15">GPIO 15</option><option value="7">GPIO 7</option><option value="6">GPIO 6</option><option value="5">GPIO 5</option>
       </select>
+      <label for="pulse_baht_inc">Baht per Pulse:</label>
+      <input type="number" name="pulse_baht_inc" value="0" min="0">
+      <small>e.g. 5 = one pulse per 5 baht paid (for coin-selector emulation). 0 = a single pulse per transaction regardless of amount.</small>
     </div>
-    
+
     <div id="mode_thankyou" class="mode-settings">
       <h3>Thank You Screen Settings</h3>
       <label for="ty_api">API URL:</label>
@@ -90,30 +93,16 @@ window.onload = function() { scanWifi(); };
       <label for="ty_msg">Thank You Message:</label>
       <input type="text" name="ty_msg" value="Thank You!">
     </div>
-    
+
     <div id="mode_payment" class="mode-settings">
       <h3>Payment Screen Settings</h3>
       <label for="pay_inc">Increment/Decrement Value:</label>
       <input type="number" name="pay_inc" value="10">
-      <label for="pay_gen_qr">Endpoint Gen QR Code:</label>
-      <input type="text" name="pay_gen_qr" placeholder="https://.../gen.php?amount=" required>
-      <label for="pay_chk_stat">Endpoint Check Status:</label>
-      <input type="text" name="pay_chk_stat" placeholder="https://.../status.php?id=" required>
       <label for="pay_ty_msg">Thank You Message:</label>
       <input type="text" name="pay_ty_msg" value="Payment Received!">
     </div>
 
-    <h2>3. Firmware Update (Optional)</h2>
-    <label for="ota_url">Firmware Check Endpoint:</label>
-    <input type="text" name="ota_url" placeholder="https://.../firmware_check.php?key=XXXX&version=">
-    <small>Checked every 6 hours; downloads and installs automatically if a newer version is available. Leave blank to disable.</small>
-
-    <h2>4. Payment Voice Announcement (Optional)</h2>
-    <label for="tts_url">Payment Audio Endpoint:</label>
-    <input type="text" name="tts_url" placeholder="https://.../tts_payment.php?key=XXXX&amount=">
-    <small>Plays "Received payment of ... baht, thank you" out loud on successful payment. Leave blank to disable.</small>
-
-    <h2>5. Idle Banner Slideshow (Optional)</h2>
+    <h2>3. Idle Banner Slideshow (Optional)</h2>
     <small>Shown full-screen (cycling every 5s if more than one) when the device has been idle (no touch) for the timeout below. Leave all blank to disable.</small>
     <label for="banner_url_1">Banner Image URL 1 (PNG):</label>
     <input type="text" name="banner_url_1" placeholder="https://.../banner1.png">
