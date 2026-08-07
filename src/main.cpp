@@ -47,7 +47,6 @@ static lv_obj_t *numpad_overlay = NULL;
 static lv_style_t style_numpad_bg;
 static lv_style_t style_numpad_btn;
 // FreeRTOS Handles
-static SemaphoreHandle_t lvgl_mutex;
 static QueueHandle_t network_queue;
 
 // =================================
@@ -319,7 +318,7 @@ static void amount_panel_event_cb(lv_event_t *e)
 
 void create_ui_setup_ap_screen()
 {
-    if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE)
+    if (lvgl_port_lock(0))
     {
         lv_obj_t *screen = lv_obj_create(NULL);
         lv_obj_set_style_bg_color(screen, lv_color_hex(0x003a57), LV_PART_MAIN);
@@ -337,14 +336,14 @@ void create_ui_setup_ap_screen()
         lv_obj_center(lbl_info);
 
         lv_scr_load(screen);
-        xSemaphoreGive(lvgl_mutex);
+        lvgl_port_unlock();
     }
 }
 
 // UI for WiFi Connecting Screen
 void create_ui_connecting_wifi_screen(const char *ssid)
 {
-    if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE)
+    if (lvgl_port_lock(0))
     {
         lv_obj_t *screen = lv_obj_create(NULL);
         lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
@@ -360,7 +359,7 @@ void create_ui_connecting_wifi_screen(const char *ssid)
         lv_obj_align_to(lbl_status, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 15);
 
         lv_scr_load(screen);
-        xSemaphoreGive(lvgl_mutex);
+        lvgl_port_unlock();
     }
 }
 
@@ -402,13 +401,15 @@ void create_main_payment_screen()
 {
     input_amount_str = "0";
     payment_amount = 0;
-    // หน้าจอถูก clean ทิ้งด้านล่าง - ต้องล้าง pointer เก่าก่อน ไม่งั้นจะชี้ไปยัง object ที่ถูกลบแล้ว
+    // screen เก่าจะถูกลบทิ้งด้านล่าง - ต้องล้าง pointer เก่าก่อน ไม่งั้นจะชี้ไปยัง object ที่ถูกลบแล้ว
     numpad_overlay = NULL;
     numpad = NULL;
     countdown_label_global = NULL;
 
-    lv_obj_t *screen = lv_scr_act();
-    lv_obj_clean(screen);
+    // สร้าง screen ใหม่ + lv_scr_load() แบบเดียวกับหน้าจออื่นๆ ในแอป (connecting/QR/setup)
+    // แทนที่จะแก้ไข lv_scr_act() ในที่ — พบว่าการแก้ไข screen เดิมทำให้บาง object ไม่ถูกรีเฟรชขึ้นจอจริง
+    lv_obj_t *old_screen = lv_scr_act();
+    lv_obj_t *screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(screen, COL_BG, 0);
     lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0x0C1014), 0);
     lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
@@ -532,6 +533,14 @@ void create_main_payment_screen()
     lv_obj_add_style(keypad, &style_numpad_btn, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(keypad, COL_ACCENT, LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_text_color(keypad, lv_color_hex(0x06231F), LV_PART_ITEMS | LV_STATE_PRESSED);
+
+    lv_scr_load(screen);
+    // ลบ screen เก่าแบบ async กันปัญหา use-after-free กรณีฟังก์ชันนี้ถูกเรียกจาก event callback
+    // ของ object ที่อยู่บน screen เก่านั้นเอง (เช่นปุ่ม cancel/clear) ซึ่งยังทำงานไม่เสร็จ
+    if (old_screen != NULL)
+    {
+        lv_obj_del_async(old_screen);
+    }
 }
 
 void create_qr_payment_screen(const char *qr_data, const char *payment_intent_id, int amount)
@@ -633,7 +642,7 @@ void create_qr_payment_screen(const char *qr_data, const char *payment_intent_id
     xTaskCreate(check_payment_status_task, "CheckStatusTask", 4096, p_intent_id, 5, &payment_check_task_handle);
 }
 
-void show_result_screen(bool success)
+void show_result_screen(bool success, const char *custom_success_msg)
 {
     lv_obj_t *result_overlay = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(result_overlay);
@@ -669,7 +678,10 @@ void show_result_screen(bool success)
     lv_obj_t *label = lv_label_create(result_overlay);
     lv_obj_set_style_text_font(label, &sarabun_28, 0);
     lv_obj_set_style_text_color(label, COL_TEXT, 0);
-    lv_label_set_text(label, success ? "ชำระเงินสำเร็จ" : "หมดเวลาทำรายการ");
+    if (success && custom_success_msg != NULL && strlen(custom_success_msg) > 0)
+        lv_label_set_text(label, custom_success_msg);
+    else
+        lv_label_set_text(label, success ? "ชำระเงินสำเร็จ" : "หมดเวลาทำรายการ");
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 40);
 
     lv_obj_t *hint = lv_label_create(result_overlay);
@@ -758,7 +770,59 @@ void check_payment_status_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 
-    if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE)
+    // ทำงานตาม Operating Mode หลังชำระเงินสำเร็จ (Pulse / Thank You / Payment)
+    String result_message = "";
+    if (payment_succeeded)
+    {
+        preferences.begin("paybox-cfg", true);
+        int op_mode = preferences.getInt(P_OP_MODE, 3);
+        preferences.end();
+
+        switch (op_mode)
+        {
+        case 1: // Pulse Mode: ดีเลย์สั้นๆ แล้วส่งสัญญาณ pulse ออก GPIO ที่ตั้งค่าไว้
+        {
+            preferences.begin("paybox-cfg", true);
+            int pulse_pin = preferences.getInt(P_PULSE_PIN, 14);
+            preferences.end();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            pinMode(pulse_pin, OUTPUT);
+            digitalWrite(pulse_pin, HIGH);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            digitalWrite(pulse_pin, LOW);
+            break;
+        }
+        case 2: // Thank You Mode: เรียก API ที่ตั้งไว้ (แทน {MAC}) แล้วแสดงข้อความที่ตั้งไว้
+        {
+            preferences.begin("paybox-cfg", true);
+            String ty_api = preferences.getString(P_THANKYOU_API, "");
+            String ty_msg = preferences.getString(P_THANKYOU_MSG, "Thank You!");
+            preferences.end();
+            result_message = ty_msg;
+
+            if (ty_api.length() > 0 && WiFi.status() == WL_CONNECTED)
+            {
+                ty_api.replace("{MAC}", WiFi.macAddress());
+                HTTPClient http_ty;
+                if (http_ty.begin(ty_api))
+                {
+                    http_ty.GET();
+                    http_ty.end();
+                }
+            }
+            break;
+        }
+        default: // Payment Mode: ใช้ข้อความ Thank You ที่ตั้งค่าไว้สำหรับหน้าชำระเงิน
+        {
+            preferences.begin("paybox-cfg", true);
+            result_message = preferences.getString(P_PAY_THANKYOU_MSG, "");
+            preferences.end();
+            break;
+        }
+        }
+    }
+
+    if (lvgl_port_lock(0))
     {
 
         if (qr_countdown_timer != NULL)
@@ -773,8 +837,8 @@ void check_payment_status_task(void *pvParameters)
             }
         }
 
-        show_result_screen(payment_succeeded);
-        xSemaphoreGive(lvgl_mutex);
+        show_result_screen(payment_succeeded, result_message.c_str());
+        lvgl_port_unlock();
     }
     free(payment_intent_id);
     payment_check_task_handle = NULL;
@@ -809,7 +873,7 @@ static void minus_btn_event_cb(lv_event_t *e)
 
 void show_loading_spinner()
 {
-    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    if (lvgl_port_lock(10))
     {
         lv_obj_t *overlay = lv_obj_create(lv_scr_act());
         lv_obj_remove_style_all(overlay);
@@ -828,7 +892,7 @@ void show_loading_spinner()
         lv_obj_set_style_text_font(label, &sarabun_20, 0);
         lv_obj_align_to(label, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 15);
 
-        xSemaphoreGive(lvgl_mutex);
+        lvgl_port_unlock();
     }
 }
 
@@ -898,7 +962,7 @@ void network_task(void *pvParameters)
             }
 
             // ล็อค LVGL เพื่ออัปเดตหน้าจอ
-            if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE)
+            if (lvgl_port_lock(0))
             {
                 if (success && qr_data_buffer != NULL && intent_id_buffer != NULL)
                 {
@@ -907,10 +971,9 @@ void network_task(void *pvParameters)
                 }
                 else
                 {
-                    lv_obj_clean(lv_scr_act());
                     create_main_payment_screen();
                 }
-                xSemaphoreGive(lvgl_mutex);
+                lvgl_port_unlock();
             }
 
             // 4. คืนค่าหน่วยความจำที่เราจองไว้สำหรับ qr_data
@@ -953,32 +1016,36 @@ void main_app_task(void *pvParameters)
         preferences.end();
         create_ui_connecting_wifi_screen(ssid.c_str());
         WiFi.mode(WIFI_STA);
+        // ปิด WiFi power-save ฝั่ง ESP32 — ถ้าเปิดไว้ (ค่า default) จะชนกับ power-saving ของ
+        // iPhone Personal Hotspot (และ router บางรุ่น) ทำให้หลุด-ต่อ WiFi วนซ้ำๆ ทั้งที่สัญญาณปกติดี
+        WiFi.setSleep(false);
+        Serial.printf("Connecting to WiFi SSID='%s'...\n", ssid.c_str());
         WiFi.begin(ssid.c_str(), pass.c_str());
-        if (WiFi.waitForConnectResult(30000) == WL_CONNECTED)
+        uint8_t wifi_result = WiFi.waitForConnectResult(30000);
+        Serial.printf("WiFi.waitForConnectResult() returned status=%d\n", (int)wifi_result);
+        if (wifi_result == WL_CONNECTED)
         {
+            Serial.printf("WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
             current_app_state = APP_STATE_RUNNING;
-            if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE)
+            if (lvgl_port_lock(0))
             {
                 switch (op_mode)
                 {
-                case 1: // Pulse Mode
-                    // create_ui_pulse_mode_screen();
-                    break;
-                case 2: // Thank You Mode
-                    // create_ui_thank_you_mode_screen();
-                    break;
-                case 3:
+                case 1: // Pulse Mode: ทำ flow ชำระเงินเหมือนกัน แต่หลังสำเร็จจะส่ง pulse ออก GPIO แทน
+                case 2: // Thank You Mode: ทำ flow ชำระเงินเหมือนกัน แต่หลังสำเร็จจะเรียก API + โชว์ข้อความ Thank You แทน
+                case 3: // Payment Mode: flow ชำระเงินปกติ
                     create_main_payment_screen();
                     xTaskCreate(network_task, "NetworkTask", 10240, NULL, 2, NULL);
                     break;
                 default:
                     break;
                 }
-                xSemaphoreGive(lvgl_mutex);
+                lvgl_port_unlock();
             }
         }
         else
         {
+            Serial.println("WiFi connect failed/timed out. Clearing config and restarting...");
             preferences.begin("paybox-cfg", false);
             preferences.clear();
             preferences.end();
@@ -1002,7 +1069,6 @@ void setup()
     cfg.lvgl_port_cfg.task_priority = 5;
     bsp_display_start_with_config(&cfg);
     bsp_display_backlight_on();
-    lvgl_mutex = xSemaphoreCreateMutex();
     network_queue = xQueueCreate(5, sizeof(NetworkRequest));
     xTaskCreate(main_app_task, "MainAppTask", 8192, NULL, 2, NULL);
     Serial.println("Setup complete. Handing over to FreeRTOS tasks.");
@@ -1010,10 +1076,10 @@ void setup()
 
 void loop()
 {
-    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        lv_timer_handler();
-        xSemaphoreGive(lvgl_mutex);
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // bsp_display_start_with_config() สร้าง task ภายใน (lvgl_port_task ใน lv_port.c) ที่เรียก
+    // lv_timer_handler() เองอยู่แล้วโดยใช้ lock ของตัวเอง (lvgl_port_lock/unlock) — เดิมโค้ดตรงนี้เรียก
+    // lv_timer_handler() ซ้ำอีกรอบโดยใช้ mutex คนละตัว (lvgl_mutex) ทำให้สอง task เข้าถึง LVGL
+    // พร้อมกันแบบไม่ synchronize กัน (LVGL ไม่ thread-safe) เป็นสาเหตุของอาการจอค้าง/render ไม่ครบ
+    // ที่เจอแบบสุ่มๆ — เอาออกแล้วปล่อยให้ lvgl_port_task จัดการ refresh คนเดียว
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
