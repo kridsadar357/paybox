@@ -8,6 +8,12 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <PNGdec.h>
+#include <driver/i2s.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
+
+#define FIRMWARE_VERSION "1.0.0"
 
 // FreeRTOS
 #include "freertos/queue.h"
@@ -19,6 +25,12 @@ extern "C"
     LV_FONT_DECLARE(sarabun_20);
     LV_FONT_DECLARE(sarabun_28);
 }
+
+// I2S audio output pin — ยืนยันแล้วว่าถูกต้องสำหรับบอร์ดนี้ (เช็คผ่าน SD_MMC pin ในไฟล์ pin config
+// ชุดเดียวกันแล้วเจอการ์ดจริง แปลว่า pin ชุดนี้ตรงกับบอร์ดจริง รวมถึง audio pin ด้วย)
+#define AUDIO_I2S_BCK_IO 42
+#define AUDIO_I2S_LRCK_IO 2
+#define AUDIO_I2S_DO_IO 41
 // =================================
 //   GLOBAL OBJECTS & HANDLES
 // =================================
@@ -49,6 +61,24 @@ static lv_style_t style_numpad_btn;
 // FreeRTOS Handles
 static QueueHandle_t network_queue;
 
+// Idle Banner Slideshow (แสดงเต็มจอสลับรูปเมื่อไม่มีการแตะหน้าจอ)
+#define MAX_BANNERS 5
+static PNG banner_png; // ใช้ตัวเดียวร่วมกัน decode ทีละรูปตามลำดับ (ไม่ทำพร้อมกัน กันข้อมูลชนกัน)
+static uint16_t *banner_img_bufs[MAX_BANNERS] = {NULL, NULL, NULL, NULL, NULL};
+static int banner_img_ws[MAX_BANNERS] = {0};
+static int banner_img_hs[MAX_BANNERS] = {0};
+static volatile bool banner_slot_ready[MAX_BANNERS] = {false};
+static lv_img_dsc_t banner_img_dscs[MAX_BANNERS];
+static bool banner_active = false;
+static uint32_t banner_idle_ms = 20000;
+static int banner_slide_index = -1;
+static lv_obj_t *banner_img_obj = NULL;
+static lv_timer_t *banner_slide_timer = NULL;
+// ใช้เป็นปลายทางชั่วคราวระหว่าง decode รูปแต่ละ slot (banner_png_draw_cb เขียนลงตรงนี้)
+static uint16_t *banner_decode_target_buf = NULL;
+static int banner_decode_target_w = 0;
+static int banner_decode_target_h = 0;
+
 // =================================
 //   CONFIGURATION & CONSTANTS
 // =================================
@@ -67,6 +97,13 @@ const char *P_PAY_INCREMENT = "pay_inc";
 const char *P_PAY_GEN_QR = "pay_gen_qr";
 const char *P_PAY_CHECK_STATUS = "pay_chk_stat";
 const char *P_PAY_THANKYOU_MSG = "pay_ty_msg";
+// เสียงแจ้งเตือนตอนชำระเงินสำเร็จ (ใช้ร่วมกันทุกโหมด)
+const char *P_TTS_URL = "tts_url";
+// OTA firmware update (ใช้ร่วมกันทุกโหมด)
+const char *P_OTA_URL = "ota_url";
+// Idle Banner Slideshow (ใช้ร่วมกันทุกโหมด)
+const char *P_BANNER_URL[MAX_BANNERS] = {"banner_url_1", "banner_url_2", "banner_url_3", "banner_url_4", "banner_url_5"};
+const char *P_BANNER_IDLE_SEC = "banner_idle";
 
 // App State
 enum AppState
@@ -86,6 +123,12 @@ struct NetworkRequest
 void main_app_task(void *pvParameters);
 void network_task(void *pvParameters);
 void create_main_payment_screen();
+void create_banner_screen();
+void banner_fetch_task(void *pvParameters);
+void play_payment_audio_task(void *pvParameters);
+void ota_check_task(void *pvParameters);
+static void idle_check_timer_cb(lv_timer_t *timer);
+static void banner_dismiss_event_cb(lv_event_t *e);
 void handle_web_save();
 void show_loading_spinner();
 static void minus_btn_event_cb(lv_event_t *e);
@@ -167,6 +210,21 @@ void handle_web_save()
         preferences.putString(P_PAY_THANKYOU_MSG, server.arg("pay_ty_msg"));
         break;
     }
+
+    // Save OTA Firmware Update (ใช้ร่วมกันทุกโหมด, ไม่บังคับ)
+    preferences.putString(P_OTA_URL, server.arg("ota_url"));
+
+    // Save Payment Voice Announcement (ใช้ร่วมกันทุกโหมด, ไม่บังคับ)
+    preferences.putString(P_TTS_URL, server.arg("tts_url"));
+
+    // Save Idle Banner Slideshow (ใช้ร่วมกันทุกโหมด, ไม่บังคับ, สูงสุด 5 รูป)
+    for (int i = 0; i < MAX_BANNERS; i++)
+    {
+        String fieldName = "banner_url_" + String(i + 1);
+        preferences.putString(P_BANNER_URL[i], server.arg(fieldName));
+    }
+    int bannerIdleSec = server.arg("banner_idle_sec").toInt();
+    preferences.putInt(P_BANNER_IDLE_SEC, bannerIdleSec > 0 ? bannerIdleSec : 20);
 
     preferences.putBool(P_CONFIGURED, true);
     preferences.end();
@@ -397,8 +455,269 @@ void style_init(void)
     lv_style_set_text_font(&style_numpad_btn, &lv_font_montserrat_26);
 }
 
+// =================================================================
+//   IDLE BANNER (แสดงรูปเต็มจอเมื่อไม่มีการแตะหน้าจอ)
+// =================================================================
+
+// เรียกทีละบรรทัด (scanline) โดย PNGdec ระหว่าง decode — แปลงเป็น RGB565 ใส่ลง buffer ปลายทาง
+// (banner_decode_target_* ถูกตั้งไว้ก่อนเรียก decode() ของแต่ละ slot ตามลำดับ ไม่ทำพร้อมกันหลาย slot)
+static void banner_png_draw_cb(PNGDRAW *pDraw)
+{
+    if (banner_decode_target_buf != NULL && pDraw->y < banner_decode_target_h)
+    {
+        // 0x00FFFFFF = blend พื้นที่โปร่งใสของรูปกับพื้นขาว (banner screen พื้นขาว)
+        banner_png.getLineAsRGB565(pDraw, &banner_decode_target_buf[pDraw->y * banner_decode_target_w], PNG_RGB565_BIG_ENDIAN, 0x00FFFFFF);
+    }
+}
+
+// ถอดรหัส PNG ที่โหลดมาไว้ใน RAM แล้วเก็บผลเป็น RGB565 ไว้ใช้ซ้ำที่ slot ที่ระบุ
+static void decode_and_cache_banner_png(uint8_t *png_data, int png_size, int slot)
+{
+    int rc = banner_png.openRAM(png_data, png_size, banner_png_draw_cb);
+    if (rc != PNG_SUCCESS)
+    {
+        Serial.printf("Banner[%d]: openRAM failed, rc=%d\n", slot, rc);
+        return;
+    }
+
+    int w = banner_png.getWidth();
+    int h = banner_png.getHeight();
+    // จำกัดขนาดต่อรูปให้เล็กลงกว่าตอนมีรูปเดียว เพราะตอนนี้อาจมีสูงสุด 5 รูปพร้อมกันใน PSRAM
+    if (w <= 0 || h <= 0 || (uint32_t)w * (uint32_t)h * 2 > 900 * 1024)
+    {
+        Serial.printf("Banner[%d]: invalid or too-large image %dx%d\n", slot, w, h);
+        banner_png.close();
+        return;
+    }
+
+    uint16_t *buf = (uint16_t *)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
+    if (buf == NULL)
+    {
+        Serial.printf("Banner[%d]: out of PSRAM for image buffer\n", slot);
+        banner_png.close();
+        return;
+    }
+
+    banner_decode_target_buf = buf;
+    banner_decode_target_w = w;
+    banner_decode_target_h = h;
+
+    rc = banner_png.decode(NULL, 0);
+    banner_png.close();
+    banner_decode_target_buf = NULL;
+
+    if (rc != PNG_SUCCESS)
+    {
+        Serial.printf("Banner[%d]: decode failed, rc=%d\n", slot, rc);
+        heap_caps_free(buf);
+        return;
+    }
+
+    banner_img_bufs[slot] = buf;
+    banner_img_ws[slot] = w;
+    banner_img_hs[slot] = h;
+    banner_slot_ready[slot] = true;
+    Serial.printf("Banner[%d]: image ready %dx%d\n", slot, w, h);
+}
+
+// โหลดรูปทีละ URL ตามลำดับ (ไม่พร้อมกัน กัน PNG decoderตัวเดียวชนกัน) มาไว้ใน RAM ครั้งเดียวตอนบูต
+// แล้วถอดรหัสเก็บไว้ ไม่ต้องโหลดซ้ำทุกครั้งที่ idle
+void banner_fetch_task(void *pvParameters)
+{
+    String *urls = (String *)pvParameters;
+
+    for (int slot = 0; slot < MAX_BANNERS; slot++)
+    {
+        if (urls[slot].length() == 0)
+        {
+            continue;
+        }
+
+        HTTPClient banner_http;
+        if (banner_http.begin(urls[slot]))
+        {
+            int httpCode = banner_http.GET();
+            if (httpCode == HTTP_CODE_OK)
+            {
+                int len = banner_http.getSize();
+                if (len > 0 && len < 900 * 1024)
+                {
+                    uint8_t *png_buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+                    if (png_buf != NULL)
+                    {
+                        WiFiClient *stream = banner_http.getStreamPtr();
+                        int total_read = 0;
+                        unsigned long start_time = millis();
+                        while (total_read < len && banner_http.connected() && (millis() - start_time) < 20000)
+                        {
+                            int avail = stream->available();
+                            if (avail > 0)
+                            {
+                                int to_read = avail < (len - total_read) ? avail : (len - total_read);
+                                int r = stream->readBytes(png_buf + total_read, to_read);
+                                total_read += r;
+                            }
+                            else
+                            {
+                                vTaskDelay(pdMS_TO_TICKS(5));
+                            }
+                        }
+
+                        if (total_read == len)
+                        {
+                            decode_and_cache_banner_png(png_buf, len, slot);
+                        }
+                        else
+                        {
+                            Serial.printf("Banner[%d]: download incomplete (%d/%d bytes)\n", slot, total_read, len);
+                        }
+                        heap_caps_free(png_buf);
+                    }
+                    else
+                    {
+                        Serial.printf("Banner[%d]: out of PSRAM for download buffer\n", slot);
+                    }
+                }
+                else
+                {
+                    Serial.printf("Banner[%d]: invalid content length %d\n", slot, len);
+                }
+            }
+            else
+            {
+                Serial.printf("Banner[%d]: HTTP GET failed, code=%d\n", slot, httpCode);
+            }
+            banner_http.end();
+        }
+    }
+
+    delete[] urls;
+    vTaskDelete(NULL);
+}
+
+// แสดงรูปที่ slot ที่ระบุบน banner_img_obj ที่มีอยู่แล้ว (ใช้ตอนเปิด banner ครั้งแรก และตอนสไลด์เปลี่ยนรูป)
+static void banner_show_slide(int slot)
+{
+    if (banner_img_obj == NULL || !banner_slot_ready[slot])
+    {
+        return;
+    }
+
+    banner_img_dscs[slot].header.always_zero = 0;
+    banner_img_dscs[slot].header.w = banner_img_ws[slot];
+    banner_img_dscs[slot].header.h = banner_img_hs[slot];
+    banner_img_dscs[slot].header.cf = LV_IMG_CF_TRUE_COLOR;
+    banner_img_dscs[slot].data_size = (uint32_t)banner_img_ws[slot] * (uint32_t)banner_img_hs[slot] * 2;
+    banner_img_dscs[slot].data = (const uint8_t *)banner_img_bufs[slot];
+
+    lv_img_set_src(banner_img_obj, &banner_img_dscs[slot]);
+
+    // ปรับขนาดรูปให้พอดีจอ (480x320) ตามสัดส่วนเดิม ไม่ว่าไฟล์ต้นทางจะขนาดเท่าไหร่ก็ตาม
+    // (256 = ขนาดจริง 1:1 ใน lv_img_set_zoom, ไม่ขยายเกิน 256 กันภาพแตก)
+    int zoom_w = (480 * 256) / banner_img_ws[slot];
+    int zoom_h = (320 * 256) / banner_img_hs[slot];
+    int zoom = zoom_w < zoom_h ? zoom_w : zoom_h;
+    if (zoom > 256)
+    {
+        zoom = 256;
+    }
+    lv_img_set_zoom(banner_img_obj, zoom);
+    lv_obj_center(banner_img_obj);
+}
+
+static void banner_slide_timer_cb(lv_timer_t *timer)
+{
+    for (int i = 1; i <= MAX_BANNERS; i++)
+    {
+        int next = (banner_slide_index + i) % MAX_BANNERS;
+        if (banner_slot_ready[next])
+        {
+            banner_slide_index = next;
+            banner_show_slide(next);
+            break;
+        }
+    }
+}
+
+static void banner_dismiss_event_cb(lv_event_t *e)
+{
+    if (banner_slide_timer != NULL)
+    {
+        lv_timer_del(banner_slide_timer);
+        banner_slide_timer = NULL;
+    }
+    banner_img_obj = NULL;
+    lv_disp_trig_activity(NULL);
+    create_main_payment_screen();
+}
+
+void create_banner_screen()
+{
+    int first_ready = -1;
+    for (int i = 0; i < MAX_BANNERS; i++)
+    {
+        if (banner_slot_ready[i])
+        {
+            first_ready = i;
+            break;
+        }
+    }
+    if (first_ready < 0)
+    {
+        return;
+    }
+
+    lv_obj_t *old_screen = lv_scr_act();
+    lv_obj_t *screen = lv_obj_create(NULL);
+    lv_obj_remove_style_all(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(screen, banner_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
+
+    banner_img_obj = lv_img_create(screen);
+    banner_slide_index = first_ready;
+    banner_show_slide(first_ready);
+
+    if (banner_slide_timer != NULL)
+    {
+        lv_timer_del(banner_slide_timer);
+    }
+    banner_slide_timer = lv_timer_create(banner_slide_timer_cb, 5000, NULL); // เปลี่ยนรูปทุก 5 วิ
+
+    lv_scr_load(screen);
+    if (old_screen != NULL)
+    {
+        lv_obj_del_async(old_screen);
+    }
+}
+
+static bool any_banner_ready()
+{
+    for (int i = 0; i < MAX_BANNERS; i++)
+    {
+        if (banner_slot_ready[i])
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void idle_check_timer_cb(lv_timer_t *timer)
+{
+    if (!banner_active && any_banner_ready() && banner_idle_ms > 0 &&
+        lv_disp_get_inactive_time(NULL) >= banner_idle_ms)
+    {
+        banner_active = true;
+        create_banner_screen();
+    }
+}
+
 void create_main_payment_screen()
 {
+    banner_active = false;
     input_amount_str = "0";
     payment_amount = 0;
     // screen เก่าจะถูกลบทิ้งด้านล่าง - ต้องล้าง pointer เก่าก่อน ไม่งั้นจะชี้ไปยัง object ที่ถูกลบแล้ว
@@ -732,6 +1051,234 @@ static void cancel_payment_event_cb(lv_event_t *e)
     create_main_payment_screen();
 }
 
+// =================================================================
+//   PAYMENT AUDIO (แจ้งด้วยเสียงตอนชำระเงินสำเร็จ ผ่านลำโพง I2S)
+// =================================================================
+
+// ดึงเฉพาะ PCM data chunk จากไฟล์ WAV แบบไม่ยึดตำแหน่ง byte ตายตัว (เหมือนฝั่ง backend
+// เผื่อมี metadata chunk แทรกก่อน data ทำให้ header ยาวไม่เท่ากัน)
+static bool find_wav_data_chunk(uint8_t *wav_bytes, int wav_size, uint8_t **out_data, int *out_len)
+{
+    if (wav_size < 12 || memcmp(wav_bytes, "RIFF", 4) != 0 || memcmp(wav_bytes + 8, "WAVE", 4) != 0)
+    {
+        return false;
+    }
+    int pos = 12;
+    while (pos + 8 <= wav_size)
+    {
+        uint32_t chunk_size;
+        memcpy(&chunk_size, wav_bytes + pos + 4, 4);
+        if (memcmp(wav_bytes + pos, "data", 4) == 0)
+        {
+            if (pos + 8 + (int)chunk_size > wav_size)
+            {
+                chunk_size = wav_size - pos - 8; // กันไฟล์ขาด
+            }
+            *out_data = wav_bytes + pos + 8;
+            *out_len = (int)chunk_size;
+            return true;
+        }
+        pos += 8 + (int)chunk_size + ((int)chunk_size % 2);
+    }
+    return false;
+}
+
+// เล่น PCM 16-bit mono ผ่าน I2S — ขยายเป็น stereo (ก็อปปี้ช่องซ้าย=ขวา) เพื่อให้เข้ากับ I2S amp
+// ส่วนใหญ่ที่มักคาดหวังข้อมูลแบบ stereo แม้เนื้อเสียงจะเป็น mono ก็ตาม
+static void play_pcm16_mono_via_i2s(const int16_t *samples, int sample_count, int sample_rate)
+{
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = (uint32_t)sample_rate,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 512,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0,
+    };
+    i2s_pin_config_t pin_config = {
+        .mck_io_num = I2S_PIN_NO_CHANGE,
+        .bck_io_num = AUDIO_I2S_BCK_IO,
+        .ws_io_num = AUDIO_I2S_LRCK_IO,
+        .data_out_num = AUDIO_I2S_DO_IO,
+        .data_in_num = I2S_PIN_NO_CHANGE,
+    };
+
+    if (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) != ESP_OK)
+    {
+        Serial.println("PaymentAudio: i2s_driver_install failed");
+        return;
+    }
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+
+    const int CHUNK = 512;
+    int16_t stereo_buf[CHUNK * 2];
+    size_t bytes_written;
+    for (int i = 0; i < sample_count; i += CHUNK)
+    {
+        int n = (i + CHUNK <= sample_count) ? CHUNK : (sample_count - i);
+        for (int j = 0; j < n; j++)
+        {
+            stereo_buf[j * 2] = samples[i + j];
+            stereo_buf[j * 2 + 1] = samples[i + j];
+        }
+        i2s_write(I2S_NUM_0, stereo_buf, n * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+    }
+
+    i2s_driver_uninstall(I2S_NUM_0);
+}
+
+// ดาวน์โหลดไฟล์เสียงแจ้งยอดชำระจาก backend แล้วเล่นผ่านลำโพง — รันใน task แยกไม่ให้บล็อกงานอื่น
+void play_payment_audio_task(void *pvParameters)
+{
+    int amount = (int)(intptr_t)pvParameters;
+
+    preferences.begin("paybox-cfg", true);
+    String ttsUrlBase = preferences.getString(P_TTS_URL, "https://ttmb-tech.com/paybox-api/tts_payment.php?key=eac86d7a2a8faf09051ac70d70d20901&amount=");
+    preferences.end();
+
+    if (ttsUrlBase.length() == 0)
+    {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    String fullUrl = ttsUrlBase + String(amount);
+    HTTPClient http_tts;
+    if (http_tts.begin(fullUrl))
+    {
+        int httpCode = http_tts.GET();
+        if (httpCode == HTTP_CODE_OK)
+        {
+            int len = http_tts.getSize();
+            if (len > 44 && len < 2 * 1024 * 1024)
+            {
+                uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+                if (wav_buf != NULL)
+                {
+                    WiFiClient *stream = http_tts.getStreamPtr();
+                    int total_read = 0;
+                    unsigned long start_time = millis();
+                    while (total_read < len && http_tts.connected() && (millis() - start_time) < 15000)
+                    {
+                        int avail = stream->available();
+                        if (avail > 0)
+                        {
+                            int to_read = avail < (len - total_read) ? avail : (len - total_read);
+                            total_read += stream->readBytes(wav_buf + total_read, to_read);
+                        }
+                        else
+                        {
+                            vTaskDelay(pdMS_TO_TICKS(5));
+                        }
+                    }
+
+                    if (total_read == len)
+                    {
+                        uint8_t *pcm_data = NULL;
+                        int pcm_len = 0;
+                        if (find_wav_data_chunk(wav_buf, len, &pcm_data, &pcm_len) && pcm_len > 0)
+                        {
+                            play_pcm16_mono_via_i2s((const int16_t *)pcm_data, pcm_len / 2, 16000);
+                        }
+                        else
+                        {
+                            Serial.println("PaymentAudio: could not find WAV data chunk");
+                        }
+                    }
+                    else
+                    {
+                        Serial.printf("PaymentAudio: download incomplete (%d/%d bytes)\n", total_read, len);
+                    }
+                    heap_caps_free(wav_buf);
+                }
+            }
+            else
+            {
+                Serial.printf("PaymentAudio: invalid content length %d\n", len);
+            }
+        }
+        else
+        {
+            Serial.printf("PaymentAudio: HTTP GET failed, code=%d\n", httpCode);
+        }
+        http_tts.end();
+    }
+
+    vTaskDelete(NULL);
+}
+
+// =================================================================
+//   OTA FIRMWARE UPDATE
+// =================================================================
+
+// เช็คเวอร์ชันใหม่จาก backend เป็นระยะๆ ถ้ามีใหม่กว่าปัจจุบันให้โหลด+แฟลชแล้ว reboot อัตโนมัติ
+void ota_check_task(void *pvParameters)
+{
+    char *ota_url_base = (char *)pvParameters;
+
+    // รอให้ผ่านช่วงบูตที่มีงานอื่นแย่ง DRAM เยอะไปก่อน (banner fetch, network task ฯลฯ)
+    // ลดโอกาส TLS handshake ล้มเหลวเพราะจองหน่วยความจำไม่ได้
+    vTaskDelay(pdMS_TO_TICKS(15000));
+
+    while (true)
+    {
+        HTTPClient http_ota;
+        String full_url = String(ota_url_base) + FIRMWARE_VERSION;
+        if (http_ota.begin(full_url))
+        {
+            int httpCode = http_ota.GET();
+            if (httpCode == HTTP_CODE_OK)
+            {
+                String payload = http_ota.getString();
+                DynamicJsonDocument doc(512);
+                DeserializationError err = deserializeJson(doc, payload);
+                if (!err && doc["update_available"] == true && doc.containsKey("url"))
+                {
+                    String bin_url = doc["url"].as<String>();
+                    String new_version = doc["version"] | "unknown";
+                    http_ota.end();
+
+                    Serial.printf("OTA: update available (%s -> %s), downloading...\n", FIRMWARE_VERSION, new_version.c_str());
+
+                    WiFiClientSecure ota_client;
+                    ota_client.setInsecure(); // ไม่ pin certificate เหมือน endpoint อื่นในระบบนี้
+                    httpUpdate.rebootOnUpdate(true);
+                    t_httpUpdate_return ret = httpUpdate.update(ota_client, bin_url);
+                    switch (ret)
+                    {
+                    case HTTP_UPDATE_FAILED:
+                        Serial.printf("OTA: update failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+                        break;
+                    case HTTP_UPDATE_NO_UPDATES:
+                        Serial.println("OTA: no updates (unexpected — server said update was available)");
+                        break;
+                    case HTTP_UPDATE_OK:
+                        Serial.println("OTA: update installed, rebooting...");
+                        break;
+                    }
+                    // ถ้าสำเร็จ อุปกรณ์ reboot เองแล้ว (rebootOnUpdate(true)) โค้ดหลังจุดนี้จะไม่ทำงาน
+                }
+                else
+                {
+                    http_ota.end();
+                }
+            }
+            else
+            {
+                Serial.printf("OTA: check failed, HTTP code=%d\n", httpCode);
+                http_ota.end();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(6UL * 60UL * 60UL * 1000UL)); // เช็คซ้ำทุก 6 ชั่วโมง
+    }
+}
+
 void check_payment_status_task(void *pvParameters)
 {
     char *payment_intent_id = (char *)pvParameters;
@@ -774,6 +1321,9 @@ void check_payment_status_task(void *pvParameters)
     String result_message = "";
     if (payment_succeeded)
     {
+        // แจ้งด้วยเสียงว่าได้รับเงินจำนวนเท่าไหร่ — รันแยก task กันบล็อกงานอื่น (Pulse/ThankYou/แสดงผล)
+        xTaskCreate(play_payment_audio_task, "PaymentAudio", 8192, (void *)(intptr_t)payment_amount, 1, NULL);
+
         preferences.begin("paybox-cfg", true);
         int op_mode = preferences.getInt(P_OP_MODE, 3);
         preferences.end();
@@ -1027,6 +1577,36 @@ void main_app_task(void *pvParameters)
         {
             Serial.printf("WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
             current_app_state = APP_STATE_RUNNING;
+
+            preferences.begin("paybox-cfg", true);
+            String otaUrl = preferences.getString(P_OTA_URL, "https://ttmb-tech.com/paybox-api/firmware_check.php?key=eac86d7a2a8faf09051ac70d70d20901&version=");
+            preferences.end();
+            if (otaUrl.length() > 0)
+            {
+                char *otaUrlCopy = strdup(otaUrl.c_str());
+                xTaskCreate(ota_check_task, "OtaCheck", 8192, otaUrlCopy, 1, NULL);
+            }
+
+            preferences.begin("paybox-cfg", true);
+            // เว้นค่า default ไว้เฉพาะ slot แรกเพื่อทดสอบ ส่วน slot 2-5 เป็น placeholder ตัวอย่าง
+            // (เข้าหน้า setup แล้วเปลี่ยนเป็น URL จริงของแต่ละร้านได้ทีหลัง)
+            static const char *default_banner_urls[MAX_BANNERS] = {
+                "https://ttmb-tech.com/paybox-api/banner1.png",
+                "https://placehold.co/480x320/1a73e8/white.png?text=Banner+2",
+                "https://placehold.co/480x320/e91e63/white.png?text=Banner+3",
+                "https://placehold.co/480x320/34a853/white.png?text=Banner+4",
+                "https://placehold.co/480x320/fbbc05/333333.png?text=Banner+5",
+            };
+            String *bannerUrls = new String[MAX_BANNERS];
+            for (int i = 0; i < MAX_BANNERS; i++)
+            {
+                bannerUrls[i] = preferences.getString(P_BANNER_URL[i], default_banner_urls[i]);
+            }
+            int bannerIdleSec = preferences.getInt(P_BANNER_IDLE_SEC, 20);
+            preferences.end();
+            banner_idle_ms = (uint32_t)(bannerIdleSec > 0 ? bannerIdleSec : 20) * 1000;
+            xTaskCreate(banner_fetch_task, "BannerFetch", 12288, bannerUrls, 1, NULL);
+
             if (lvgl_port_lock(0))
             {
                 switch (op_mode)
@@ -1036,6 +1616,7 @@ void main_app_task(void *pvParameters)
                 case 3: // Payment Mode: flow ชำระเงินปกติ
                     create_main_payment_screen();
                     xTaskCreate(network_task, "NetworkTask", 10240, NULL, 2, NULL);
+                    lv_timer_create(idle_check_timer_cb, 1000, NULL);
                     break;
                 default:
                     break;

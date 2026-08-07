@@ -102,7 +102,32 @@ window.onload = function() { scanWifi(); };
       <label for="pay_ty_msg">Thank You Message:</label>
       <input type="text" name="pay_ty_msg" value="Payment Received!">
     </div>
-    
+
+    <h2>3. Firmware Update (Optional)</h2>
+    <label for="ota_url">Firmware Check Endpoint:</label>
+    <input type="text" name="ota_url" placeholder="https://.../firmware_check.php?key=XXXX&version=">
+    <small>Checked every 6 hours; downloads and installs automatically if a newer version is available. Leave blank to disable.</small>
+
+    <h2>4. Payment Voice Announcement (Optional)</h2>
+    <label for="tts_url">Payment Audio Endpoint:</label>
+    <input type="text" name="tts_url" placeholder="https://.../tts_payment.php?key=XXXX&amount=">
+    <small>Plays "Received payment of ... baht, thank you" out loud on successful payment. Leave blank to disable.</small>
+
+    <h2>5. Idle Banner Slideshow (Optional)</h2>
+    <small>Shown full-screen (cycling every 5s if more than one) when the device has been idle (no touch) for the timeout below. Leave all blank to disable.</small>
+    <label for="banner_url_1">Banner Image URL 1 (PNG):</label>
+    <input type="text" name="banner_url_1" placeholder="https://.../banner1.png">
+    <label for="banner_url_2">Banner Image URL 2 (PNG):</label>
+    <input type="text" name="banner_url_2" placeholder="https://.../banner2.png">
+    <label for="banner_url_3">Banner Image URL 3 (PNG):</label>
+    <input type="text" name="banner_url_3" placeholder="https://.../banner3.png">
+    <label for="banner_url_4">Banner Image URL 4 (PNG):</label>
+    <input type="text" name="banner_url_4" placeholder="https://.../banner4.png">
+    <label for="banner_url_5">Banner Image URL 5 (PNG):</label>
+    <input type="text" name="banner_url_5" placeholder="https://.../banner5.png">
+    <label for="banner_idle_sec">Idle Timeout (seconds):</label>
+    <input type="number" name="banner_idle_sec" value="20" min="5">
+
     <button type="submit">Save & Reboot</button>
   </form>
 </div>
