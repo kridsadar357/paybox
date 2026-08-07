@@ -9,6 +9,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <PNGdec.h>
+#include <JPEGDEC.h>
 #include <driver/i2s.h>
 #include <math.h>
 #include <new>
@@ -95,6 +96,11 @@ struct DeviceConfig
     String pay_ty_msg = "Payment Received!";
     String banner_urls[MAX_BANNERS];
     int banner_idle_sec = 20;
+    // Video banner (MJPEG - ชุดเฟรม JPEG ต่อกัน ไม่ใช่ decode video codec จริง เพราะ ESP32-S3 ไม่มี
+    // hardware decode วิดีโอ) banner_urls[i] เป็น base URL ของโฟลเดอร์เฟรมถ้า banner_is_video[i]=true
+    bool banner_is_video[MAX_BANNERS] = {false, false, false, false, false};
+    int banner_fps[MAX_BANNERS] = {8, 8, 8, 8, 8};
+    int banner_frame_counts[MAX_BANNERS] = {0, 0, 0, 0, 0};
 };
 static DeviceConfig g_cfg;
 // PNG decoder struct หนักมาก (~40KB, ตัว ucZLIB buffer ข้างในอย่างเดียวก็ 32KB) ถ้าเป็น global ตรงๆ
@@ -127,11 +133,37 @@ static uint32_t banner_idle_ms = 20000;
 static bool payment_in_progress = false;
 static int banner_slide_index = -1;
 static lv_obj_t *banner_img_obj = NULL;
-static lv_timer_t *banner_slide_timer = NULL;
 // ใช้เป็นปลายทางชั่วคราวระหว่าง decode รูปแต่ละ slot (banner_png_draw_cb เขียนลงตรงนี้)
 static uint16_t *banner_decode_target_buf = NULL;
 static int banner_decode_target_w = 0;
 static int banner_decode_target_h = 0;
+
+// Video banner (MJPEG) — เฟรม JPEG ถูก sync ลง SD การ์ดไว้ล่วงหน้า (ไม่ decode ทั้งวิดีโอเก็บใน PSRAM
+// พร้อมกันเพราะจะกินความจำมหาศาล) แล้ว decode ทีละเฟรมจาก SD ตอนกำลังเล่นจริง ใช้ JPEGDEC ตัวเดียว
+// ที่จองผ่าน PSRAM เหมือน PNG decoder (กันปัญหา DRAM เดิมซ้ำ แม้ JPEGDEC จะเบากว่า PNG มาก)
+static JPEGDEC *banner_jpeg_ptr = NULL;
+static uint16_t *video_frame_buf = NULL;
+static int video_frame_buf_w = 0;
+static int video_frame_buf_h = 0;
+static int video_playing_slot = -1;
+static int video_current_frame = 0;
+static lv_img_dsc_t video_img_dsc;
+// ตัวจับเวลาตัวเดียวที่ใช้ร่วมกันทั้งสไลด์รูปนิ่ง (fixed 5 วิ) และสไลด์วิดีโอ (ทีละเฟรมตาม fps) —
+// แทนที่ banner_slide_timer เดิมที่เป็น fixed-interval อย่างเดียว
+static lv_timer_t *banner_advance_timer = NULL;
+
+static JPEGDEC *get_banner_jpeg()
+{
+    if (banner_jpeg_ptr == NULL)
+    {
+        void *mem = heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_SPIRAM);
+        if (mem != NULL)
+        {
+            banner_jpeg_ptr = new (mem) JPEGDEC();
+        }
+    }
+    return banner_jpeg_ptr;
+}
 
 // =================================
 //   CONFIGURATION & CONSTANTS
@@ -163,6 +195,16 @@ struct NetworkRequest
     int amount;
 };
 
+// ส่งให้ banner_fetch_task เป็นชุดเดียว (แทน String* ตัวเดียวแบบเดิม) เพราะตอนนี้แต่ละ slot
+// ต้องรู้ด้วยว่าเป็นรูปนิ่งหรือวิดีโอ (MJPEG) รวมถึง fps/จำนวนเฟรมถ้าเป็นวิดีโอ
+struct BannerFetchParams
+{
+    String urls[MAX_BANNERS];
+    bool is_video[MAX_BANNERS];
+    int fps[MAX_BANNERS];
+    int frame_count[MAX_BANNERS];
+};
+
 void main_app_task(void *pvParameters);
 void network_task(void *pvParameters);
 void create_main_payment_screen();
@@ -172,6 +214,10 @@ void load_cached_device_config();
 bool fetch_device_config();
 void create_banner_screen();
 void banner_fetch_task(void *pvParameters);
+static void banner_display_slide(int slot);
+static void banner_advance_to_next_slide();
+static bool video_show_frame(int slot, int frame_num);
+static bool download_file_to_sd(const String &url, const String &sdPath);
 void play_payment_audio_task(void *pvParameters);
 void sync_audio_clips_task(void *pvParameters);
 void ota_check_task(void *pvParameters);
@@ -598,6 +644,9 @@ void load_cached_device_config()
     for (int i = 0; i < MAX_BANNERS; i++)
     {
         g_cfg.banner_urls[i] = preferences.getString(("c_ban" + String(i)).c_str(), "");
+        g_cfg.banner_is_video[i] = preferences.getBool(("c_bvid" + String(i)).c_str(), false);
+        g_cfg.banner_fps[i] = preferences.getInt(("c_bfps" + String(i)).c_str(), 8);
+        g_cfg.banner_frame_counts[i] = preferences.getInt(("c_bfc" + String(i)).c_str(), 0);
     }
     g_cfg.banner_idle_sec = preferences.getInt("c_banidle", 20);
     preferences.end();
@@ -641,7 +690,7 @@ bool fetch_device_config()
         if (httpCode == HTTP_CODE_OK)
         {
             String payload = http_cfg.getString();
-            DynamicJsonDocument doc(2048);
+            DynamicJsonDocument doc(3072);
             if (deserializeJson(doc, payload) == DeserializationError::Ok && doc["success"] == true)
             {
                 g_cfg.shop_name = String((const char *)(doc["shop_name"] | "357 PAYBOX"));
@@ -681,6 +730,37 @@ bool fetch_device_config()
                     }
                 }
 
+                JsonArray typeArr = doc["banner_types"].as<JsonArray>();
+                int ti = 0;
+                for (JsonVariant v : typeArr)
+                {
+                    if (ti < MAX_BANNERS)
+                    {
+                        const char *t = v | "image";
+                        g_cfg.banner_is_video[ti++] = (strcmp(t, "video") == 0);
+                    }
+                }
+
+                JsonArray fpsArr = doc["banner_fps"].as<JsonArray>();
+                int fi = 0;
+                for (JsonVariant v : fpsArr)
+                {
+                    if (fi < MAX_BANNERS)
+                    {
+                        g_cfg.banner_fps[fi++] = v.as<int>() > 0 ? v.as<int>() : 8;
+                    }
+                }
+
+                JsonArray fcArr = doc["banner_frame_counts"].as<JsonArray>();
+                int fci = 0;
+                for (JsonVariant v : fcArr)
+                {
+                    if (fci < MAX_BANNERS)
+                    {
+                        g_cfg.banner_frame_counts[fci++] = v.as<int>();
+                    }
+                }
+
                 ok = true;
 
                 preferences.begin("paybox-cfg", false);
@@ -705,6 +785,9 @@ bool fetch_device_config()
                 for (int i = 0; i < MAX_BANNERS; i++)
                 {
                     preferences.putString(("c_ban" + String(i)).c_str(), g_cfg.banner_urls[i]);
+                    preferences.putBool(("c_bvid" + String(i)).c_str(), g_cfg.banner_is_video[i]);
+                    preferences.putInt(("c_bfps" + String(i)).c_str(), g_cfg.banner_fps[i]);
+                    preferences.putInt(("c_bfc" + String(i)).c_str(), g_cfg.banner_frame_counts[i]);
                 }
                 preferences.end();
 
@@ -834,21 +917,74 @@ static void decode_and_cache_banner_png(uint8_t *png_data, int png_size, int slo
     Serial.printf("Banner[%d]: image ready %dx%d\n", slot, w, h);
 }
 
-// โหลดรูปทีละ URL ตามลำดับ (ไม่พร้อมกัน กัน PNG decoderตัวเดียวชนกัน) มาไว้ใน RAM ครั้งเดียวตอนบูต
-// แล้วถอดรหัสเก็บไว้ ไม่ต้องโหลดซ้ำทุกครั้งที่ idle
+// โหลด banner ทีละ slot ตามลำดับ (ไม่พร้อมกัน กัน decoder ตัวเดียวชนกัน) มาไว้ครั้งเดียวตอนบูต
+// รูปนิ่ง: ดาวน์โหลด+ถอดรหัสเก็บเป็น RGB565 ใน PSRAM (ของเดิม)
+// วิดีโอ: sync เฟรม JPEG ที่ยังไม่มีลง SD การ์ด (ข้ามเฟรมที่มีอยู่แล้ว) ไม่ decode ล่วงหน้า เพราะ
+// เก็บทุกเฟรมเป็น RGB565 พร้อมกันจะกิน PSRAM มหาศาล — decode ทีละเฟรมตอนเล่นจริงแทน (video_show_frame)
 void banner_fetch_task(void *pvParameters)
 {
-    String *urls = (String *)pvParameters;
+    BannerFetchParams *params = (BannerFetchParams *)pvParameters;
 
     for (int slot = 0; slot < MAX_BANNERS; slot++)
     {
-        if (urls[slot].length() == 0)
+        if (params->urls[slot].length() == 0)
         {
             continue;
         }
 
+        if (params->is_video[slot])
+        {
+            int frameCount = params->frame_count[slot];
+            if (frameCount <= 0)
+            {
+                continue;
+            }
+
+            String dir = "/bvideo_" + String(slot);
+            if (!SD_MMC.exists(dir))
+            {
+                SD_MMC.mkdir(dir);
+            }
+
+            bool allOk = true;
+            for (int f = 1; f <= frameCount; f++)
+            {
+                char frameName[24];
+                snprintf(frameName, sizeof(frameName), "/frame_%04d.jpg", f);
+                String sdPath = dir + String(frameName);
+
+                File existing = SD_MMC.open(sdPath, FILE_READ);
+                bool alreadyThere = existing && existing.size() > 0;
+                if (existing)
+                {
+                    existing.close();
+                }
+                if (alreadyThere)
+                {
+                    continue;
+                }
+
+                char urlSuffix[24];
+                snprintf(urlSuffix, sizeof(urlSuffix), "frame_%04d.jpg", f);
+                String frameUrl = params->urls[slot] + urlSuffix;
+                if (!download_file_to_sd(frameUrl, sdPath))
+                {
+                    Serial.printf("BannerVideo[%d]: failed to sync frame %d/%d\n", slot, f, frameCount);
+                    allOk = false;
+                    break;
+                }
+            }
+
+            if (allOk)
+            {
+                banner_slot_ready[slot] = true;
+                Serial.printf("BannerVideo[%d]: %d frames ready on SD\n", slot, frameCount);
+            }
+            continue;
+        }
+
         HTTPClient banner_http;
-        if (banner_http.begin(urls[slot]))
+        if (banner_http.begin(params->urls[slot]))
         {
             int httpCode = banner_http.GET();
             if (httpCode == HTTP_CODE_OK)
@@ -905,7 +1041,7 @@ void banner_fetch_task(void *pvParameters)
         }
     }
 
-    delete[] urls;
+    delete params;
     vTaskDelete(NULL);
 }
 
@@ -939,7 +1075,182 @@ static void banner_show_slide(int slot)
     lv_obj_center(banner_img_obj);
 }
 
-static void banner_slide_timer_cb(lv_timer_t *timer)
+// เรียก callback ทีละ MCU block ระหว่าง JPEGDEC decode — เขียนลง video_frame_buf ที่เตรียมไว้
+// (video_decode_target_* ตั้งไว้ก่อนเรียก decode() เสมอ ใช้ตัวแปรร่วมกับ PNG ไม่ได้เพราะรูปทรง
+// callback ต่างกัน (JPEG เป็น block, PNG เป็น scanline) เลยแยกชื่อเป็นคนละตัว)
+static uint16_t *video_decode_target_buf = NULL;
+static int video_decode_target_w = 0;
+static int video_decode_target_h = 0;
+
+static int video_jpeg_draw_cb(JPEGDRAW *pDraw)
+{
+    if (video_decode_target_buf == NULL)
+    {
+        return 0;
+    }
+    for (int row = 0; row < pDraw->iHeight; row++)
+    {
+        int dstY = pDraw->y + row;
+        if (dstY < 0 || dstY >= video_decode_target_h)
+        {
+            continue;
+        }
+        int copyW = pDraw->iWidthUsed;
+        if (pDraw->x + copyW > video_decode_target_w)
+        {
+            copyW = video_decode_target_w - pDraw->x;
+        }
+        if (copyW > 0)
+        {
+            memcpy(&video_decode_target_buf[dstY * video_decode_target_w + pDraw->x],
+                   &pDraw->pPixels[row * pDraw->iWidth], copyW * 2);
+        }
+    }
+    return 1;
+}
+
+// ถอดรหัสเฟรมที่ frame_num ของวิดีโอ slot ที่ระบุจาก SD การ์ด แล้วโชว์ทันที (ใช้ buffer เดียวซ้ำทุก
+// เฟรม จองตามขนาดจริงของเฟรมแรก — เฟรมถัดๆ ไปของวิดีโอเดียวกันควรขนาดเท่ากันเสมอเพราะมาจาก ffmpeg
+// รอบเดียวกัน แต่ถ้าขนาดเปลี่ยน (สลับ slot อื่น) จะจองใหม่ให้พอดี)
+static bool video_show_frame(int slot, int frame_num)
+{
+    JPEGDEC *jpeg = get_banner_jpeg();
+    if (jpeg == NULL || banner_img_obj == NULL)
+    {
+        return false;
+    }
+
+    char path[32];
+    snprintf(path, sizeof(path), "/bvideo_%d/frame_%04d.jpg", slot, frame_num);
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f)
+    {
+        Serial.printf("BannerVideo[%d]: frame %d missing on SD\n", slot, frame_num);
+        return false;
+    }
+
+    // อ่านทั้งไฟล์ใส่ PSRAM แล้วใช้ openRAM() แทน open(File&,...) — ไฟล์เฟรมเล็ก (จำกัดไว้ 150KB/เฟรม
+    // ตอนอัปโหลด) จึงทำได้สบายๆ เหมือน pattern เดิมของ PNG banner (openRAM(png_buf,...))
+    size_t fsize = f.size();
+    uint8_t *jpg_buf = (fsize > 0) ? (uint8_t *)heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM) : NULL;
+    if (jpg_buf == NULL)
+    {
+        f.close();
+        Serial.printf("BannerVideo[%d]: out of PSRAM for frame %d (%u bytes)\n", slot, frame_num, (unsigned)fsize);
+        return false;
+    }
+    size_t readLen = f.read(jpg_buf, fsize);
+    f.close();
+
+    bool ok = false;
+    if (readLen == fsize && jpeg->openRAM(jpg_buf, (int)fsize, video_jpeg_draw_cb))
+    {
+        int w = jpeg->getWidth();
+        int h = jpeg->getHeight();
+        if (w > 0 && h > 0 && (uint32_t)w * (uint32_t)h * 2 <= 400 * 1024)
+        {
+            if (video_frame_buf == NULL || video_frame_buf_w != w || video_frame_buf_h != h)
+            {
+                if (video_frame_buf != NULL)
+                {
+                    heap_caps_free(video_frame_buf);
+                    video_frame_buf = NULL;
+                }
+                video_frame_buf = (uint16_t *)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
+                video_frame_buf_w = w;
+                video_frame_buf_h = h;
+            }
+
+            if (video_frame_buf != NULL)
+            {
+                video_decode_target_buf = video_frame_buf;
+                video_decode_target_w = w;
+                video_decode_target_h = h;
+                ok = jpeg->decode(0, 0, 0) == 1;
+                video_decode_target_buf = NULL;
+            }
+        }
+        jpeg->close();
+    }
+    heap_caps_free(jpg_buf);
+
+    if (!ok || video_frame_buf == NULL)
+    {
+        return false;
+    }
+
+    video_img_dsc.header.always_zero = 0;
+    video_img_dsc.header.w = video_frame_buf_w;
+    video_img_dsc.header.h = video_frame_buf_h;
+    video_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+    video_img_dsc.data_size = (uint32_t)video_frame_buf_w * (uint32_t)video_frame_buf_h * 2;
+    video_img_dsc.data = (const uint8_t *)video_frame_buf;
+    lv_img_set_src(banner_img_obj, &video_img_dsc);
+
+    int zoom_w = (480 * 256) / video_frame_buf_w;
+    int zoom_h = (320 * 256) / video_frame_buf_h;
+    int zoom = zoom_w < zoom_h ? zoom_w : zoom_h;
+    if (zoom > 256)
+    {
+        zoom = 256;
+    }
+    lv_img_set_zoom(banner_img_obj, zoom);
+    lv_obj_center(banner_img_obj);
+    return true;
+}
+
+// ตัวจับเวลาสำหรับสไลด์รูปนิ่ง (fixed 5 วิ แล้วเปลี่ยน) — ยิงครั้งเดียวแล้วลบตัวเอง
+static void banner_image_advance_cb(lv_timer_t *timer)
+{
+    banner_advance_timer = NULL;
+    banner_advance_to_next_slide();
+}
+
+// ตัวจับเวลาสำหรับเล่นวิดีโอทีละเฟรมตาม fps — เมื่อครบทุกเฟรมของไฟล์นี้แล้วให้ไป banner ถัดไปเอง
+static void banner_video_frame_cb(lv_timer_t *timer)
+{
+    video_current_frame++;
+    int frameCount = g_cfg.banner_frame_counts[video_playing_slot];
+    if (video_current_frame > frameCount || !video_show_frame(video_playing_slot, video_current_frame))
+    {
+        lv_timer_del(timer);
+        banner_advance_timer = NULL;
+        banner_advance_to_next_slide();
+    }
+}
+
+// แสดง banner slide ที่ระบุ (รูปนิ่งหรือวิดีโอก็ได้) แล้วตั้งเวลาสำหรับ "จบแล้วไปตัวถัดไป" ให้เหมาะกับ
+// ประเภทของ slide นั้น — ใช้แทนที่ทั้ง banner_show_slide()+fixed timer เดิม เป็นจุดเดียวที่คุมการสไลด์
+static void banner_display_slide(int slot)
+{
+    if (banner_advance_timer != NULL)
+    {
+        lv_timer_del(banner_advance_timer);
+        banner_advance_timer = NULL;
+    }
+    video_playing_slot = -1;
+
+    if (g_cfg.banner_is_video[slot] && g_cfg.banner_frame_counts[slot] > 0)
+    {
+        video_playing_slot = slot;
+        video_current_frame = 1;
+        if (!video_show_frame(slot, 1))
+        {
+            banner_advance_to_next_slide();
+            return;
+        }
+        int fps = g_cfg.banner_fps[slot] > 0 ? g_cfg.banner_fps[slot] : 8;
+        banner_advance_timer = lv_timer_create(banner_video_frame_cb, 1000 / fps, NULL);
+    }
+    else
+    {
+        banner_show_slide(slot);
+        banner_advance_timer = lv_timer_create(banner_image_advance_cb, 5000, NULL);
+        lv_timer_set_repeat_count(banner_advance_timer, 1);
+    }
+}
+
+static void banner_advance_to_next_slide()
 {
     for (int i = 1; i <= MAX_BANNERS; i++)
     {
@@ -947,7 +1258,7 @@ static void banner_slide_timer_cb(lv_timer_t *timer)
         if (banner_slot_ready[next])
         {
             banner_slide_index = next;
-            banner_show_slide(next);
+            banner_display_slide(next);
             break;
         }
     }
@@ -955,11 +1266,12 @@ static void banner_slide_timer_cb(lv_timer_t *timer)
 
 static void banner_dismiss_event_cb(lv_event_t *e)
 {
-    if (banner_slide_timer != NULL)
+    if (banner_advance_timer != NULL)
     {
-        lv_timer_del(banner_slide_timer);
-        banner_slide_timer = NULL;
+        lv_timer_del(banner_advance_timer);
+        banner_advance_timer = NULL;
     }
+    video_playing_slot = -1;
     banner_img_obj = NULL;
     lv_disp_trig_activity(NULL);
     create_payment_entry_screen();
@@ -992,13 +1304,7 @@ void create_banner_screen()
 
     banner_img_obj = lv_img_create(screen);
     banner_slide_index = first_ready;
-    banner_show_slide(first_ready);
-
-    if (banner_slide_timer != NULL)
-    {
-        lv_timer_del(banner_slide_timer);
-    }
-    banner_slide_timer = lv_timer_create(banner_slide_timer_cb, 5000, NULL); // เปลี่ยนรูปทุก 5 วิ
+    banner_display_slide(first_ready);
 
     lv_scr_load(screen);
     if (old_screen != NULL)
@@ -1333,30 +1639,41 @@ void create_button_payment_screen()
     {
         int amt = g_cfg.preset_amount_count > 0 ? g_cfg.preset_amounts[i] : defaults[i];
 
+        // ปุ่มพื้นเข้มกว่ารอบก่อน (มืดสนิทกลืนกับพื้นหลัง) เพิ่มคอนทราสต์ + จุดเด่นสีเขียวมิ้นท์
+        // ให้เห็นชัดเจนตั้งแต่มองครั้งแรก แทนที่จะเป็นกล่องสีเทาเรียบๆ ทั้งจอ
         lv_obj_t *btn = lv_btn_create(grid);
         lv_obj_set_size(btn, BTN_W, BTN_H);
-        lv_obj_set_style_bg_color(btn, COL_SURFACE, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1F2933), 0);
+        lv_obj_set_style_bg_grad_color(btn, lv_color_hex(0x151A21), 0);
+        lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_VER, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn, 14, 0);
-        lv_obj_set_style_border_width(btn, 1, 0);
-        lv_obj_set_style_border_color(btn, COL_BORDER, 0);
-        lv_obj_set_style_shadow_width(btn, 12, 0);
-        lv_obj_set_style_shadow_color(btn, lv_color_black(), 0);
-        lv_obj_set_style_shadow_opa(btn, LV_OPA_30, 0);
+        lv_obj_set_style_border_side(btn, LV_BORDER_SIDE_TOP, 0);
+        lv_obj_set_style_border_width(btn, 3, 0);
+        lv_obj_set_style_border_color(btn, COL_ACCENT, 0);
+        lv_obj_set_style_border_opa(btn, LV_OPA_80, 0);
+        lv_obj_set_style_shadow_width(btn, 16, 0);
+        lv_obj_set_style_shadow_color(btn, COL_ACCENT, 0);
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_20, 0);
+        lv_obj_set_style_shadow_ofs_y(btn, 3, 0);
         lv_obj_set_style_bg_color(btn, COL_ACCENT, LV_STATE_PRESSED);
-        lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_grad_color(btn, COL_ACCENT_DIM, LV_STATE_PRESSED);
+        lv_obj_set_style_border_opa(btn, LV_OPA_TRANSP, LV_STATE_PRESSED);
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_50, LV_STATE_PRESSED);
         lv_obj_add_event_cb(btn, preset_amount_btn_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)amt);
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text_fmt(lbl, "%d", amt);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(lbl, COL_ACCENT, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x06231F), LV_STATE_PRESSED);
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -10);
 
         lv_obj_t *unit = lv_label_create(btn);
         lv_label_set_text(unit, "บาท");
         lv_obj_set_style_text_font(unit, &sarabun_20, 0);
         lv_obj_set_style_text_color(unit, COL_MUTED, 0);
+        lv_obj_set_style_text_color(unit, lv_color_hex(0x06231F), LV_STATE_PRESSED);
         lv_obj_align_to(unit, lbl, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
     }
 
@@ -2293,13 +2610,16 @@ void main_app_task(void *pvParameters)
             String otaUrl = String(BACKEND_BASE_URL) + "firmware_check.php?key=" + g_device_key + "&version=";
             xTaskCreate(ota_check_task, "OtaCheck", 8192, strdup(otaUrl.c_str()), 1, NULL);
 
-            String *bannerUrls = new String[MAX_BANNERS];
+            BannerFetchParams *bannerParams = new BannerFetchParams();
             for (int i = 0; i < MAX_BANNERS; i++)
             {
-                bannerUrls[i] = g_cfg.banner_urls[i];
+                bannerParams->urls[i] = g_cfg.banner_urls[i];
+                bannerParams->is_video[i] = g_cfg.banner_is_video[i];
+                bannerParams->fps[i] = g_cfg.banner_fps[i];
+                bannerParams->frame_count[i] = g_cfg.banner_frame_counts[i];
             }
             banner_idle_ms = (uint32_t)(g_cfg.banner_idle_sec > 0 ? g_cfg.banner_idle_sec : 20) * 1000;
-            xTaskCreate(banner_fetch_task, "BannerFetch", 12288, bannerUrls, 1, NULL);
+            xTaskCreate(banner_fetch_task, "BannerFetch", 12288, bannerParams, 1, NULL);
 
             if (lvgl_port_lock(0))
             {
