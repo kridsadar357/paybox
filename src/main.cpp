@@ -9,7 +9,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <PNGdec.h>
-#include <JPEGDEC.h>
+#include "MjpegClass.h"
 #include <driver/i2s.h>
 #include <math.h>
 #include <new>
@@ -142,32 +142,20 @@ static uint16_t *banner_decode_target_buf = NULL;
 static int banner_decode_target_w = 0;
 static int banner_decode_target_h = 0;
 
-// Video banner (MJPEG) — เฟรม JPEG ถูก sync ลง SD การ์ดไว้ล่วงหน้า (ไม่ decode ทั้งวิดีโอเก็บใน PSRAM
-// พร้อมกันเพราะจะกินความจำมหาศาล) แล้ว decode ทีละเฟรมจาก SD ตอนกำลังเล่นจริง ใช้ JPEGDEC ตัวเดียว
-// ที่จองผ่าน PSRAM เหมือน PNG decoder (กันปัญหา DRAM เดิมซ้ำ แม้ JPEGDEC จะเบากว่า PNG มาก)
-static JPEGDEC *banner_jpeg_ptr = NULL;
+// Video banner (MJPEG) — ไฟล์เดียวที่เป็นภาพ JPEG หลายภาพต่อกัน (แบบเดียวกับตัวอย่าง DEMO_MJPEG ของ
+// ผู้ผลิตบอร์ด JC3248W535EN, ใช้ ESP32_JPEG_Library ของ Espressif เอง แทน third-party decoder) —
+// sync ไฟล์ .mjpeg ลง SD ไว้ล่วงหน้าครั้งเดียว แล้ว stream ทีละเฟรมจาก SD ตอนกำลังเล่นจริง (ไม่ decode
+// ทั้งวิดีโอเก็บใน PSRAM พร้อมกัน กินความจำมหาศาลเกินไป)
+#define VIDEO_OUTPUT_SIZE (480 * 320 * 2)          // buffer ภาพที่ decode แล้ว (RGB565 เต็มจอ)
+#define VIDEO_READ_BUFFER_SIZE (VIDEO_OUTPUT_SIZE / 20) // buffer เก็บ JPEG ดิบของเฟรมที่กำลังอ่าน
+static MjpegClass g_mjpeg;
+static uint8_t *video_read_buf = NULL;
 static uint16_t *video_frame_buf = NULL;
-static int video_frame_buf_w = 0;
-static int video_frame_buf_h = 0;
-static int video_playing_slot = -1;
-static int video_current_frame = 0;
+static File video_file;
 static lv_img_dsc_t video_img_dsc;
 // ตัวจับเวลาตัวเดียวที่ใช้ร่วมกันทั้งสไลด์รูปนิ่ง (fixed 5 วิ) และสไลด์วิดีโอ (ทีละเฟรมตาม fps) —
 // แทนที่ banner_slide_timer เดิมที่เป็น fixed-interval อย่างเดียว
 static lv_timer_t *banner_advance_timer = NULL;
-
-static JPEGDEC *get_banner_jpeg()
-{
-    if (banner_jpeg_ptr == NULL)
-    {
-        void *mem = heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_SPIRAM);
-        if (mem != NULL)
-        {
-            banner_jpeg_ptr = new (mem) JPEGDEC();
-        }
-    }
-    return banner_jpeg_ptr;
-}
 
 // =================================
 //   CONFIGURATION & CONSTANTS
@@ -221,7 +209,6 @@ void create_banner_screen();
 void banner_fetch_task(void *pvParameters);
 static void banner_display_slide(int slot);
 static void banner_advance_to_next_slide();
-static bool video_show_frame(int slot, int frame_num);
 static bool download_file_to_sd(const String &url, const String &sdPath);
 void play_payment_audio_task(void *pvParameters);
 void sync_audio_clips_task(void *pvParameters);
@@ -951,18 +938,14 @@ void banner_fetch_task(void *pvParameters)
 
         if (params->is_video[slot])
         {
-            int frameCount = params->frame_count[slot];
-            if (frameCount <= 0)
-            {
-                continue;
-            }
+            // ไฟล์เดียว (ภาพ JPEG หลายภาพต่อกัน) แทนที่การแยกเป็น frame_0001.jpg...frame_NNNN.jpg
+            // หลายไฟล์แบบเดิม — เรียบง่ายกว่า ทั้ง sync/cache-busting/ลบของเก่า เหลือแค่ไฟล์เดียว
+            String sdPath = "/bvideo_" + String(slot) + ".mjpeg";
+            String verPath = "/bvideo_" + String(slot) + ".ver";
 
-            String dir = "/bvideo_" + String(slot);
-            String verPath = dir + "/.ver";
-
-            // เช็ค version ที่เคย sync สำเร็จไว้ล่าสุดก่อน — ชื่อไฟล์เฟรมซ้ำเดิมเสมอ (frame_0001.jpg...)
-            // ทุกครั้งที่อัปโหลดใหม่ ถ้าเช็คแค่ "มีไฟล์นี้อยู่แล้วหรือยัง" จะไม่มีทางรู้ว่าเนื้อหาบน
-            // เซิร์ฟเวอร์เปลี่ยนไปแล้ว (บั๊กที่เจอจริงตอนทดสอบ — อัปโหลดวิดีโอใหม่แล้วบอร์ดยังเล่นของเก่า)
+            // เช็ค version ที่เคย sync สำเร็จไว้ล่าสุดก่อน — ชื่อไฟล์ซ้ำเดิมเสมอทุกครั้งที่อัปโหลดใหม่
+            // ถ้าเช็คแค่ "มีไฟล์นี้อยู่แล้วหรือยัง" จะไม่มีทางรู้ว่าเนื้อหาบนเซิร์ฟเวอร์เปลี่ยนไปแล้ว
+            // (บั๊กที่เจอจริงตอนทดสอบ — อัปโหลดวิดีโอใหม่แล้วบอร์ดยังเล่นของเก่า)
             int storedVersion = -1;
             if (SD_MMC.exists(verPath))
             {
@@ -981,47 +964,12 @@ void banner_fetch_task(void *pvParameters)
                 continue;
             }
 
-            if (!SD_MMC.exists(dir))
-            {
-                SD_MMC.mkdir(dir);
-            }
-            else
-            {
-                // เวอร์ชันไม่ตรง (อัปโหลดวิดีโอใหม่ทับ) ลบเฟรมเก่าทิ้งก่อน sync ใหม่ทั้งหมด กันเฟรมเก่า
-                // ตกค้างถ้าวิดีโอใหม่มีจำนวนเฟรมน้อยกว่าเดิม — ไล่ลบตามชื่อที่เป็นไปได้ทั้งหมดตาม cap
-                // ฝั่ง backend (15fps x 20 วิ = 300 เฟรมสูงสุด) remove() ไฟล์ที่ไม่มีอยู่แค่ fail เฉยๆ ไม่พัง
-                for (int f = 1; f <= 300; f++)
-                {
-                    char oldName[16];
-                    snprintf(oldName, sizeof(oldName), "/frame_%04d.jpg", f);
-                    SD_MMC.remove(dir + String(oldName));
-                }
-            }
-
-            bool allOk = true;
-            for (int f = 1; f <= frameCount; f++)
-            {
-                char frameName[24];
-                snprintf(frameName, sizeof(frameName), "/frame_%04d.jpg", f);
-                String sdPath = dir + String(frameName);
-
-                // ต่อ ?v=<version> ท้าย URL เพื่อกัน Cloudflare (ซึ่งอยู่หน้าเซิร์ฟเวอร์นี้) เสิร์ฟไฟล์
-                // .jpg แคชเก่าค้างไว้นานถึง 30 วันตาม URL เดิม — ชื่อไฟล์เฟรมซ้ำเดิมเสมอ (frame_0001.jpg)
-                // ถ้าไม่มี query string เปลี่ยนไปตาม version, CDN จะเข้าใจว่าเป็น URL เดิมและเสิร์ฟของแคช
-                // เก่าให้แม้ origin จะมีไฟล์ใหม่แล้วก็ตาม (บั๊กที่เจอจริงตอนทดสอบ — อัปโหลดวิดีโอใหม่แล้ว
-                // บอร์ดยังโหลดเฟรมเก่าจาก Cloudflare cache)
-                char urlSuffix[48];
-                snprintf(urlSuffix, sizeof(urlSuffix), "frame_%04d.jpg?v=%d", f, params->version[slot]);
-                String frameUrl = params->urls[slot] + urlSuffix;
-                if (!download_file_to_sd(frameUrl, sdPath))
-                {
-                    Serial.printf("BannerVideo[%d]: failed to sync frame %d/%d\n", slot, f, frameCount);
-                    allOk = false;
-                    break;
-                }
-            }
-
-            if (allOk)
+            // ต่อ ?v=<version> ท้าย URL เพื่อกัน Cloudflare (ซึ่งอยู่หน้าเซิร์ฟเวอร์นี้) เสิร์ฟไฟล์แคชเก่า
+            // ค้างไว้นานถึง 30 วันตาม URL เดิม — ชื่อไฟล์ซ้ำเดิมเสมอ ถ้าไม่มี query string เปลี่ยนไปตาม
+            // version, CDN จะเข้าใจว่าเป็น URL เดิมและเสิร์ฟของแคชเก่าให้แม้ origin จะมีไฟล์ใหม่แล้วก็ตาม
+            // (บั๊กที่เจอจริงตอนทดสอบ — อัปโหลดวิดีโอใหม่แล้วบอร์ดยังโหลดของเก่าจาก Cloudflare cache)
+            String videoUrl = params->urls[slot] + "?v=" + String(params->version[slot]);
+            if (download_file_to_sd(videoUrl, sdPath))
             {
                 banner_slot_ready[slot] = true;
                 File vf = SD_MMC.open(verPath, FILE_WRITE);
@@ -1030,7 +978,11 @@ void banner_fetch_task(void *pvParameters)
                     vf.print(params->version[slot]);
                     vf.close();
                 }
-                Serial.printf("BannerVideo[%d]: %d frames ready on SD (version %d)\n", slot, frameCount, params->version[slot]);
+                Serial.printf("BannerVideo[%d]: synced (version %d)\n", slot, params->version[slot]);
+            }
+            else
+            {
+                Serial.printf("BannerVideo[%d]: failed to sync .mjpeg file\n", slot);
             }
             continue;
         }
@@ -1127,120 +1079,46 @@ static void banner_show_slide(int slot)
     lv_obj_center(banner_img_obj);
 }
 
-// เรียก callback ทีละ MCU block ระหว่าง JPEGDEC decode — เขียนลง video_frame_buf ที่เตรียมไว้
-// (video_decode_target_* ตั้งไว้ก่อนเรียก decode() เสมอ ใช้ตัวแปรร่วมกับ PNG ไม่ได้เพราะรูปทรง
-// callback ต่างกัน (JPEG เป็น block, PNG เป็น scanline) เลยแยกชื่อเป็นคนละตัว)
-static uint16_t *video_decode_target_buf = NULL;
-static int video_decode_target_w = 0;
-static int video_decode_target_h = 0;
-
-static int video_jpeg_draw_cb(JPEGDRAW *pDraw)
+// ปิด stream วิดีโอที่เปิดค้างไว้ (ถ้ามี) — เรียกทั้งตอนเล่นจบปกติและตอนถูกขัดจังหวะ (ลูกค้าแตะจอ)
+static void video_stop_playback()
 {
-    if (video_decode_target_buf == NULL)
+    if (video_file)
     {
-        return 0;
+        video_file.close();
     }
-    for (int row = 0; row < pDraw->iHeight; row++)
-    {
-        int dstY = pDraw->y + row;
-        if (dstY < 0 || dstY >= video_decode_target_h)
-        {
-            continue;
-        }
-        int copyW = pDraw->iWidthUsed;
-        if (pDraw->x + copyW > video_decode_target_w)
-        {
-            copyW = video_decode_target_w - pDraw->x;
-        }
-        if (copyW > 0)
-        {
-            memcpy(&video_decode_target_buf[dstY * video_decode_target_w + pDraw->x],
-                   &pDraw->pPixels[row * pDraw->iWidth], copyW * 2);
-        }
-    }
-    return 1;
 }
 
-// ถอดรหัสเฟรมที่ frame_num ของวิดีโอ slot ที่ระบุจาก SD การ์ด แล้วโชว์ทันที (ใช้ buffer เดียวซ้ำทุก
-// เฟรม จองตามขนาดจริงของเฟรมแรก — เฟรมถัดๆ ไปของวิดีโอเดียวกันควรขนาดเท่ากันเสมอเพราะมาจาก ffmpeg
-// รอบเดียวกัน แต่ถ้าขนาดเปลี่ยน (สลับ slot อื่น) จะจองใหม่ให้พอดี)
-static bool video_show_frame(int slot, int frame_num)
+// ถอดรหัส+โชว์เฟรมถัดไปจาก stream ที่เปิดค้างไว้ (ต้องเรียก video_start_playback() ก่อนเสมอ)
+// คืน false เมื่อจบไฟล์หรือ error — ผู้เรียกจะปิด stream แล้วไป banner ถัดไปเอง
+static bool video_play_next_frame()
 {
-    JPEGDEC *jpeg = get_banner_jpeg();
-    if (jpeg == NULL || banner_img_obj == NULL)
+    if (!video_file || banner_img_obj == NULL || !video_file.available() || !g_mjpeg.readMjpegBuf())
+    {
+        return false;
+    }
+    if (!g_mjpeg.decodeJpg())
     {
         return false;
     }
 
-    char path[32];
-    snprintf(path, sizeof(path), "/bvideo_%d/frame_%04d.jpg", slot, frame_num);
-    File f = SD_MMC.open(path, FILE_READ);
-    if (!f)
-    {
-        Serial.printf("BannerVideo[%d]: frame %d missing on SD\n", slot, frame_num);
-        return false;
-    }
-
-    // อ่านทั้งไฟล์ใส่ PSRAM แล้วใช้ openRAM() แทน open(File&,...) — ไฟล์เฟรมเล็ก (จำกัดไว้ 150KB/เฟรม
-    // ตอนอัปโหลด) จึงทำได้สบายๆ เหมือน pattern เดิมของ PNG banner (openRAM(png_buf,...))
-    size_t fsize = f.size();
-    uint8_t *jpg_buf = (fsize > 0) ? (uint8_t *)heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM) : NULL;
-    if (jpg_buf == NULL)
-    {
-        f.close();
-        Serial.printf("BannerVideo[%d]: out of PSRAM for frame %d (%u bytes)\n", slot, frame_num, (unsigned)fsize);
-        return false;
-    }
-    size_t readLen = f.read(jpg_buf, fsize);
-    f.close();
-
-    bool ok = false;
-    if (readLen == fsize && jpeg->openRAM(jpg_buf, (int)fsize, video_jpeg_draw_cb))
-    {
-        int w = jpeg->getWidth();
-        int h = jpeg->getHeight();
-        if (w > 0 && h > 0 && (uint32_t)w * (uint32_t)h * 2 <= 400 * 1024)
-        {
-            if (video_frame_buf == NULL || video_frame_buf_w != w || video_frame_buf_h != h)
-            {
-                if (video_frame_buf != NULL)
-                {
-                    heap_caps_free(video_frame_buf);
-                    video_frame_buf = NULL;
-                }
-                video_frame_buf = (uint16_t *)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
-                video_frame_buf_w = w;
-                video_frame_buf_h = h;
-            }
-
-            if (video_frame_buf != NULL)
-            {
-                video_decode_target_buf = video_frame_buf;
-                video_decode_target_w = w;
-                video_decode_target_h = h;
-                ok = jpeg->decode(0, 0, 0) == 1;
-                video_decode_target_buf = NULL;
-            }
-        }
-        jpeg->close();
-    }
-    heap_caps_free(jpg_buf);
-
-    if (!ok || video_frame_buf == NULL)
+    int w = g_mjpeg.getWidth();
+    int h = g_mjpeg.getHeight();
+    if (w <= 0 || h <= 0)
     {
         return false;
     }
 
     video_img_dsc.header.always_zero = 0;
-    video_img_dsc.header.w = video_frame_buf_w;
-    video_img_dsc.header.h = video_frame_buf_h;
+    video_img_dsc.header.w = w;
+    video_img_dsc.header.h = h;
     video_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
-    video_img_dsc.data_size = (uint32_t)video_frame_buf_w * (uint32_t)video_frame_buf_h * 2;
+    video_img_dsc.data_size = (uint32_t)w * (uint32_t)h * 2;
     video_img_dsc.data = (const uint8_t *)video_frame_buf;
     lv_img_set_src(banner_img_obj, &video_img_dsc);
 
-    int zoom_w = (480 * 256) / video_frame_buf_w;
-    int zoom_h = (320 * 256) / video_frame_buf_h;
+    // ปรับขนาดให้พอดีจอ (480x320) ตามสัดส่วนเดิม เผื่อวิดีโอต้นทางไม่ได้ scale มาพอดีเป๊ะ
+    int zoom_w = (480 * 256) / w;
+    int zoom_h = (320 * 256) / h;
     int zoom = zoom_w < zoom_h ? zoom_w : zoom_h;
     if (zoom > 256)
     {
@@ -1251,6 +1129,50 @@ static bool video_show_frame(int slot, int frame_num)
     return true;
 }
 
+// เปิดไฟล์ .mjpeg (ภาพ JPEG หลายภาพต่อกัน — แบบเดียวกับตัวอย่าง DEMO_MJPEG ของผู้ผลิตบอร์ด) ของ
+// slot ที่ระบุจาก SD แล้วโชว์เฟรมแรกทันที เตรียม buffer ไว้ครั้งเดียวใช้ซ้ำได้ทุก slot/ทุกเฟรม
+static bool video_start_playback(int slot)
+{
+    if (banner_img_obj == NULL)
+    {
+        return false;
+    }
+
+    if (video_read_buf == NULL)
+    {
+        video_read_buf = (uint8_t *)heap_caps_malloc(VIDEO_READ_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    }
+    if (video_frame_buf == NULL)
+    {
+        video_frame_buf = (uint16_t *)heap_caps_aligned_alloc(16, VIDEO_OUTPUT_SIZE, MALLOC_CAP_SPIRAM);
+    }
+    if (video_read_buf == NULL || video_frame_buf == NULL)
+    {
+        Serial.println("BannerVideo: out of PSRAM for playback buffers");
+        return false;
+    }
+
+    char path[24];
+    snprintf(path, sizeof(path), "/bvideo_%d.mjpeg", slot);
+    video_file = SD_MMC.open(path, FILE_READ);
+    if (!video_file)
+    {
+        Serial.printf("BannerVideo[%d]: file missing on SD\n", slot);
+        return false;
+    }
+
+    // useBigEndian ส่งไปเฉยๆ ตาม signature เดิมของ MjpegClass (จริงๆ Espressif hardcode
+    // JPEG_RAW_TYPE_RGB565_BE ไว้อยู่แล้วข้างใน — พอดีกับจอนี้ที่ต้องการ big-endian RGB565)
+    if (!g_mjpeg.setup(&video_file, video_read_buf, video_frame_buf, VIDEO_OUTPUT_SIZE, true))
+    {
+        Serial.printf("BannerVideo[%d]: mjpeg.setup() failed\n", slot);
+        video_file.close();
+        return false;
+    }
+
+    return video_play_next_frame();
+}
+
 // ตัวจับเวลาสำหรับสไลด์รูปนิ่ง (fixed 5 วิ แล้วเปลี่ยน) — ยิงครั้งเดียวแล้วลบตัวเอง
 static void banner_image_advance_cb(lv_timer_t *timer)
 {
@@ -1258,13 +1180,12 @@ static void banner_image_advance_cb(lv_timer_t *timer)
     banner_advance_to_next_slide();
 }
 
-// ตัวจับเวลาสำหรับเล่นวิดีโอทีละเฟรมตาม fps — เมื่อครบทุกเฟรมของไฟล์นี้แล้วให้ไป banner ถัดไปเอง
+// ตัวจับเวลาสำหรับเล่นวิดีโอทีละเฟรมตาม fps — พอ stream หมด (จบไฟล์) จะไป banner ถัดไปเอง
 static void banner_video_frame_cb(lv_timer_t *timer)
 {
-    video_current_frame++;
-    int frameCount = g_cfg.banner_frame_counts[video_playing_slot];
-    if (video_current_frame > frameCount || !video_show_frame(video_playing_slot, video_current_frame))
+    if (!video_play_next_frame())
     {
+        video_stop_playback();
         lv_timer_del(timer);
         banner_advance_timer = NULL;
         banner_advance_to_next_slide();
@@ -1280,13 +1201,11 @@ static void banner_display_slide(int slot)
         lv_timer_del(banner_advance_timer);
         banner_advance_timer = NULL;
     }
-    video_playing_slot = -1;
+    video_stop_playback();
 
-    if (g_cfg.banner_is_video[slot] && g_cfg.banner_frame_counts[slot] > 0)
+    if (g_cfg.banner_is_video[slot])
     {
-        video_playing_slot = slot;
-        video_current_frame = 1;
-        if (!video_show_frame(slot, 1))
+        if (!video_start_playback(slot))
         {
             banner_advance_to_next_slide();
             return;
@@ -1323,7 +1242,7 @@ static void banner_dismiss_event_cb(lv_event_t *e)
         lv_timer_del(banner_advance_timer);
         banner_advance_timer = NULL;
     }
-    video_playing_slot = -1;
+    video_stop_playback();
     banner_img_obj = NULL;
     lv_disp_trig_activity(NULL);
     create_payment_entry_screen();
@@ -2037,7 +1956,10 @@ static bool download_file_to_sd(const String &url, const String &sdPath)
             int total = 0;
             unsigned long start_time = millis();
             unsigned long last_data_time = millis();
-            while ((millis() - start_time) < 15000)
+            // 60 วิ (ไม่ใช่ 15 วิเดิม) เพราะตอนนี้ใช้โหลดไฟล์ .mjpeg วิดีโอ banner ทั้งไฟล์ด้วย ซึ่ง
+            // ใหญ่กว่าไฟล์เสียง/เฟรมเดี่ยวๆ ที่ฟังก์ชันนี้เคยรองรับมาก การ์อคือ idle timeout 3 วิยังคง
+            // ตัดการเชื่อมต่อที่ค้างจริงๆ ได้เร็วอยู่ดี ตัวเลข 60 วิเป็นแค่เพดานสูงสุดกันค้างตลอดไป
+            while ((millis() - start_time) < 60000)
             {
                 int avail = stream->available();
                 if (avail > 0)
