@@ -18,8 +18,8 @@
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
 
-#define FIRMWARE_VERSION "1.0.0"
-#define BACKEND_BASE_URL "https://ttmb-tech.com/paybox-api/"
+#define FIRMWARE_VERSION "1.1.0"
+#define BACKEND_BASE_URL "https://orca-paybox.com/api/"
 
 // FreeRTOS
 #include "freertos/queue.h"
@@ -534,7 +534,7 @@ static void set_pairing_status_text(const char *text)
 static bool provision_register_by_mac(const String &macStr, String &outCode, bool &outIsActive)
 {
     HTTPClient http_p;
-    String url = String(BACKEND_BASE_URL) + "provision_register.php?mac=" + macStr;
+    String url = String(BACKEND_BASE_URL) + "provision_register?mac=" + macStr;
     bool ok = false;
     if (http_p.begin(url))
     {
@@ -587,7 +587,7 @@ String run_device_pairing_flow()
             bool found = true;
             bool active = false;
             HTTPClient http_p;
-            String url = String(BACKEND_BASE_URL) + "provision_status.php?code=" + code;
+            String url = String(BACKEND_BASE_URL) + "provision_status?code=" + code;
             if (http_p.begin(url))
             {
                 if (http_p.GET() == HTTP_CODE_OK)
@@ -675,7 +675,7 @@ bool fetch_device_config()
     }
 
     HTTPClient http_cfg;
-    String url = String(BACKEND_BASE_URL) + "device_config.php?key=" + g_device_key;
+    String url = String(BACKEND_BASE_URL) + "device_config?key=" + g_device_key;
     bool ok = false;
     if (http_cfg.begin(url))
     {
@@ -2242,7 +2242,7 @@ void ota_check_task(void *pvParameters)
 void check_payment_status_task(void *pvParameters)
 {
     char *payment_intent_id = (char *)pvParameters;
-    String check_status_url = String(BACKEND_BASE_URL) + "check_status.php?key=" + g_device_key + "&id=";
+    String check_status_url = String(BACKEND_BASE_URL) + "check_status?key=" + g_device_key + "&id=";
     unsigned long startTime = millis();
     bool payment_succeeded = false;
     while (millis() - startTime < 120000)
@@ -2422,7 +2422,7 @@ static void confirm_event_cb(lv_event_t *e)
 void network_task(void *pvParameters)
 {
     NetworkRequest received_req;
-    String gen_qr_url = String(BACKEND_BASE_URL) + "gen_qrcode.php?key=" + g_device_key + "&amount=";
+    String gen_qr_url = String(BACKEND_BASE_URL) + "gen_qrcode?key=" + g_device_key + "&amount=";
 
     while (1)
     {
@@ -2581,7 +2581,7 @@ void main_app_task(void *pvParameters)
 
             current_app_state = APP_STATE_RUNNING;
 
-            String otaUrl = String(BACKEND_BASE_URL) + "firmware_check.php?key=" + g_device_key + "&version=";
+            String otaUrl = String(BACKEND_BASE_URL) + "firmware_check?key=" + g_device_key + "&version=";
             xTaskCreate(ota_check_task, "OtaCheck", 8192, strdup(otaUrl.c_str()), 1, NULL);
 
             BannerFetchParams *bannerParams = new BannerFetchParams();
