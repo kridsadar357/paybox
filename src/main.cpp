@@ -1005,8 +1005,13 @@ void banner_fetch_task(void *pvParameters)
                 snprintf(frameName, sizeof(frameName), "/frame_%04d.jpg", f);
                 String sdPath = dir + String(frameName);
 
-                char urlSuffix[24];
-                snprintf(urlSuffix, sizeof(urlSuffix), "frame_%04d.jpg", f);
+                // ต่อ ?v=<version> ท้าย URL เพื่อกัน Cloudflare (ซึ่งอยู่หน้าเซิร์ฟเวอร์นี้) เสิร์ฟไฟล์
+                // .jpg แคชเก่าค้างไว้นานถึง 30 วันตาม URL เดิม — ชื่อไฟล์เฟรมซ้ำเดิมเสมอ (frame_0001.jpg)
+                // ถ้าไม่มี query string เปลี่ยนไปตาม version, CDN จะเข้าใจว่าเป็น URL เดิมและเสิร์ฟของแคช
+                // เก่าให้แม้ origin จะมีไฟล์ใหม่แล้วก็ตาม (บั๊กที่เจอจริงตอนทดสอบ — อัปโหลดวิดีโอใหม่แล้ว
+                // บอร์ดยังโหลดเฟรมเก่าจาก Cloudflare cache)
+                char urlSuffix[48];
+                snprintf(urlSuffix, sizeof(urlSuffix), "frame_%04d.jpg?v=%d", f, params->version[slot]);
                 String frameUrl = params->urls[slot] + urlSuffix;
                 if (!download_file_to_sd(frameUrl, sdPath))
                 {
