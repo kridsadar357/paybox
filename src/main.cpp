@@ -101,6 +101,10 @@ struct DeviceConfig
     bool banner_is_video[MAX_BANNERS] = {false, false, false, false, false};
     int banner_fps[MAX_BANNERS] = {8, 8, 8, 8, 8};
     int banner_frame_counts[MAX_BANNERS] = {0, 0, 0, 0, 0};
+    // เพิ่มทุกครั้งที่แอดมินอัปโหลดวิดีโอใหม่ทับ slot เดิม — ชื่อไฟล์เฟรมซ้ำเดิมเสมอ (frame_0001.jpg...)
+    // ถ้าไม่มีเลขนี้ไว้เทียบ บอร์ดจะเห็นว่า "มีไฟล์ชื่อนี้อยู่แล้ว" แล้วข้ามการโหลดใหม่ทั้งที่เนื้อหา
+    // บนเซิร์ฟเวอร์เปลี่ยนไปแล้ว (บั๊กที่เจอจริงตอนทดสอบ)
+    int banner_versions[MAX_BANNERS] = {1, 1, 1, 1, 1};
 };
 static DeviceConfig g_cfg;
 // PNG decoder struct หนักมาก (~40KB, ตัว ucZLIB buffer ข้างในอย่างเดียวก็ 32KB) ถ้าเป็น global ตรงๆ
@@ -203,6 +207,7 @@ struct BannerFetchParams
     bool is_video[MAX_BANNERS];
     int fps[MAX_BANNERS];
     int frame_count[MAX_BANNERS];
+    int version[MAX_BANNERS];
 };
 
 void main_app_task(void *pvParameters);
@@ -647,6 +652,7 @@ void load_cached_device_config()
         g_cfg.banner_is_video[i] = preferences.getBool(("c_bvid" + String(i)).c_str(), false);
         g_cfg.banner_fps[i] = preferences.getInt(("c_bfps" + String(i)).c_str(), 8);
         g_cfg.banner_frame_counts[i] = preferences.getInt(("c_bfc" + String(i)).c_str(), 0);
+        g_cfg.banner_versions[i] = preferences.getInt(("c_bver" + String(i)).c_str(), 1);
     }
     g_cfg.banner_idle_sec = preferences.getInt("c_banidle", 20);
     preferences.end();
@@ -761,6 +767,16 @@ bool fetch_device_config()
                     }
                 }
 
+                JsonArray verArr = doc["banner_versions"].as<JsonArray>();
+                int vi = 0;
+                for (JsonVariant v : verArr)
+                {
+                    if (vi < MAX_BANNERS)
+                    {
+                        g_cfg.banner_versions[vi++] = v.as<int>() > 0 ? v.as<int>() : 1;
+                    }
+                }
+
                 ok = true;
 
                 preferences.begin("paybox-cfg", false);
@@ -788,6 +804,7 @@ bool fetch_device_config()
                     preferences.putBool(("c_bvid" + String(i)).c_str(), g_cfg.banner_is_video[i]);
                     preferences.putInt(("c_bfps" + String(i)).c_str(), g_cfg.banner_fps[i]);
                     preferences.putInt(("c_bfc" + String(i)).c_str(), g_cfg.banner_frame_counts[i]);
+                    preferences.putInt(("c_bver" + String(i)).c_str(), g_cfg.banner_versions[i]);
                 }
                 preferences.end();
 
@@ -941,9 +958,44 @@ void banner_fetch_task(void *pvParameters)
             }
 
             String dir = "/bvideo_" + String(slot);
+            String verPath = dir + "/.ver";
+
+            // เช็ค version ที่เคย sync สำเร็จไว้ล่าสุดก่อน — ชื่อไฟล์เฟรมซ้ำเดิมเสมอ (frame_0001.jpg...)
+            // ทุกครั้งที่อัปโหลดใหม่ ถ้าเช็คแค่ "มีไฟล์นี้อยู่แล้วหรือยัง" จะไม่มีทางรู้ว่าเนื้อหาบน
+            // เซิร์ฟเวอร์เปลี่ยนไปแล้ว (บั๊กที่เจอจริงตอนทดสอบ — อัปโหลดวิดีโอใหม่แล้วบอร์ดยังเล่นของเก่า)
+            int storedVersion = -1;
+            if (SD_MMC.exists(verPath))
+            {
+                File vf = SD_MMC.open(verPath, FILE_READ);
+                if (vf)
+                {
+                    storedVersion = vf.parseInt();
+                    vf.close();
+                }
+            }
+
+            if (storedVersion == params->version[slot])
+            {
+                banner_slot_ready[slot] = true;
+                Serial.printf("BannerVideo[%d]: already synced (version %d), skipping\n", slot, storedVersion);
+                continue;
+            }
+
             if (!SD_MMC.exists(dir))
             {
                 SD_MMC.mkdir(dir);
+            }
+            else
+            {
+                // เวอร์ชันไม่ตรง (อัปโหลดวิดีโอใหม่ทับ) ลบเฟรมเก่าทิ้งก่อน sync ใหม่ทั้งหมด กันเฟรมเก่า
+                // ตกค้างถ้าวิดีโอใหม่มีจำนวนเฟรมน้อยกว่าเดิม — ไล่ลบตามชื่อที่เป็นไปได้ทั้งหมดตาม cap
+                // ฝั่ง backend (15fps x 20 วิ = 300 เฟรมสูงสุด) remove() ไฟล์ที่ไม่มีอยู่แค่ fail เฉยๆ ไม่พัง
+                for (int f = 1; f <= 300; f++)
+                {
+                    char oldName[16];
+                    snprintf(oldName, sizeof(oldName), "/frame_%04d.jpg", f);
+                    SD_MMC.remove(dir + String(oldName));
+                }
             }
 
             bool allOk = true;
@@ -952,17 +1004,6 @@ void banner_fetch_task(void *pvParameters)
                 char frameName[24];
                 snprintf(frameName, sizeof(frameName), "/frame_%04d.jpg", f);
                 String sdPath = dir + String(frameName);
-
-                File existing = SD_MMC.open(sdPath, FILE_READ);
-                bool alreadyThere = existing && existing.size() > 0;
-                if (existing)
-                {
-                    existing.close();
-                }
-                if (alreadyThere)
-                {
-                    continue;
-                }
 
                 char urlSuffix[24];
                 snprintf(urlSuffix, sizeof(urlSuffix), "frame_%04d.jpg", f);
@@ -978,7 +1019,13 @@ void banner_fetch_task(void *pvParameters)
             if (allOk)
             {
                 banner_slot_ready[slot] = true;
-                Serial.printf("BannerVideo[%d]: %d frames ready on SD\n", slot, frameCount);
+                File vf = SD_MMC.open(verPath, FILE_WRITE);
+                if (vf)
+                {
+                    vf.print(params->version[slot]);
+                    vf.close();
+                }
+                Serial.printf("BannerVideo[%d]: %d frames ready on SD (version %d)\n", slot, frameCount, params->version[slot]);
             }
             continue;
         }
@@ -2617,6 +2664,7 @@ void main_app_task(void *pvParameters)
                 bannerParams->is_video[i] = g_cfg.banner_is_video[i];
                 bannerParams->fps[i] = g_cfg.banner_fps[i];
                 bannerParams->frame_count[i] = g_cfg.banner_frame_counts[i];
+                bannerParams->version[i] = g_cfg.banner_versions[i];
             }
             banner_idle_ms = (uint32_t)(g_cfg.banner_idle_sec > 0 ? g_cfg.banner_idle_sec : 20) * 1000;
             xTaskCreate(banner_fetch_task, "BannerFetch", 12288, bannerParams, 1, NULL);
